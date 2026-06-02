@@ -2097,6 +2097,12 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
             job.label = "已取消"
             job.finished_at = time.time()
         logger.info("job cancelled")
+        try:
+            print("尝试重启任务\n")
+            print("重启原因：中止时发生错误\n")
+            start(open_web=False)
+        except:
+            print("重启任务失败")
         if jlog: jlog.footer(status="cancelled")
     except Exception as e:
         logger.exception("job error")
@@ -3744,9 +3750,10 @@ def api_watermark_open_out_dir():
         return jsonify({"error": str(e)}), 500
 
 
-# ---------------- 入口 ----------------
 
-def main():
+# ---------------- 启动 ----------------
+
+def start(open_web: bool):
     parser = argparse.ArgumentParser(description="本地照片擂台选片工具")
     parser.add_argument("--port", type=int, default=5057)
     parser.add_argument("--no-browser", action="store_true")
@@ -3760,11 +3767,17 @@ def main():
     print(f"运行时设备偏好: {args.runtime}")
     if SCRIPT_TOKEN:
         print(f"（脚本访问 token 已启用：X-Token: {SCRIPT_TOKEN[:8]}...）")
-    if not args.no_browser:
+    if not args.no_browser and open_web:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     # 仅监听回环：前端依赖 Origin/Referer 严格匹配防 CSRF，绑 0.0.0.0
     # 会把局域网也暴露进来，已被验证会绕过这套校验。
     app.run(host="127.0.0.1", port=args.port, debug=False)
+
+
+# ---------------- 入口 ----------------
+
+def main():
+    start(open_web=True)
 
 
 if __name__ == "__main__":
