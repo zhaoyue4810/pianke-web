@@ -166,11 +166,13 @@ class JobState:
     prescreen_enabled: bool = True
     prescreen_strength: str = "standard"
     face_aware: bool = True
+    aesthetic_enabled: bool = True
     # 土豪模式：用户选定的 Ark 模型 ID
     llm_model: Optional[str] = None
     # 流式事件——每过一张图后端追加一条，前端 streaming log 用
     recent_events: list[dict] = field(default_factory=list)
     event_seq: int = 0
+    rejected_running: int = 0
 
 
 # ---------------- 路径 / 日志 ----------------
@@ -1661,13 +1663,13 @@ def _job_event(name: str, path: str, info, reason) -> None:
     事件 schema：
         {
           seq, name, path, ok, reject, reason, verdict,
-          engine: "fast" | "expert",
+          engine: "fast" | "expert" | "tycoon" | "local_vlm",
           shutter, aperture, iso,                     # EXIF
           signals: [{kind, label, value}, ...],       # 按 engine 各自给 3 列
         }
 
     fast 信号列：hash / color / orb
-    expert 信号列：dino / 美学三联 (NIMA·MUSIQ·CLIP) / face
+    expert/local_vlm 信号列：dino / 美学三联 (NIMA·MUSIQ·CLIP) / face
     tycoon 信号列：dino / LLM 判定·理由 / face
     """
     if JOB is None:
@@ -1759,6 +1761,8 @@ def _job_event(name: str, path: str, info, reason) -> None:
         "verdict": verdict,
     }
     JOB.recent_events.append(item)
+    if auto_reject and JOB.engine == "local_vlm":
+        JOB.rejected_running += 1
     if len(JOB.recent_events) > 60:
         JOB.recent_events = JOB.recent_events[-60:]
 
@@ -1905,7 +1909,8 @@ def _wipe_caches(folder: str) -> None:
             logger.warning(f"清 _pic_selecter 目录失败: {e}")
 
 
-def _require_engine(engine: str) -> None:
+def _require_engine(engine: str, llm_model: Optional[str] = None,
+                    aesthetic_enabled: bool = True) -> None:
     """启动期硬校验当前 engine 的全部依赖。任何缺失 → 抛异常，由 _run_job 接住置 error。
 
     极速模式：cv2 (含 saliency 子模块) + imagehash —— 全部本地、无网络。
@@ -1944,8 +1949,23 @@ def _require_engine(engine: str) -> None:
         from pic_selecter import llm_judge
         vision.require_tycoon_capabilities()
         vision.prewarm_tycoon()
-        llm_judge.require_llm_capabilities()  # ARK_API_KEY + list_models() 联通
+        llm_judge.require_llm_capabilities(provider="ark", model=llm_model)  # ARK_API_KEY + list_models() 联通
         logger.info("[tycoon] 依赖校验通过：DINOv2 / InsightFace + Ark 视觉 LLM 就绪")
+    elif engine == "local_vlm":
+        # 本地 VLM 模式：默认额外跑 NIMA/MUSIQ/CLIP-IQA；关闭美学开关时只预热分组必需模型。
+        from pic_selecter import vision
+        from pic_selecter import llm_judge
+        if aesthetic_enabled:
+            vision.require_expert_capabilities()
+            vision.prewarm_all()
+        else:
+            vision.require_tycoon_capabilities()
+            vision.prewarm_tycoon()
+        llm_judge.require_llm_capabilities(provider="local_vlm", model=llm_model)
+        if aesthetic_enabled:
+            logger.info("[local_vlm] 依赖校验通过：DINOv2 / NIMA / MUSIQ / CLIP-IQA+ / InsightFace + 本地视觉 VLM 就绪")
+        else:
+            logger.info("[local_vlm] 依赖校验通过：DINOv2 / InsightFace + 本地视觉 VLM 就绪（美学模型关闭）")
     else:
         raise ValueError(f"未知 engine: {engine!r}")
 
@@ -1954,7 +1974,8 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
              threshold_near: int, threshold_far: int, near_seconds: int,
              prescreen_enabled: bool, prescreen_strength: str,
              face_aware: bool = True, engine: str = "fast",
-             llm_model: Optional[str] = None) -> None:
+             llm_model: Optional[str] = None,
+             aesthetic_enabled: bool = True) -> None:
     global SESSION, LAST_INFOS
     job = JOB
     assert job is not None
@@ -1972,6 +1993,7 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
             dry_run=dry_run,
             prescreen=f"{prescreen_enabled}/{prescreen_strength}",
             face_aware=face_aware,
+            aesthetic_enabled=aesthetic_enabled,
             llm_model=llm_model or "(none)",
             threshold_near=threshold_near,
             threshold_far=threshold_far,
@@ -1984,8 +2006,12 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
         job.status = "checking"
         job.label = f"校验 {engine} 模式依赖..."
         if jlog: jlog.event("CHECK", f"engine={engine} 依赖校验中…")
-        logger.info(f"[{engine}] 启动任务：folder={folder} prescreen={prescreen_enabled}/{prescreen_strength} mode={mode}")
-        _require_engine(engine)
+        logger.info(
+            f"[{engine}] 启动任务：folder={folder} "
+            f"prescreen={prescreen_enabled}/{prescreen_strength} "
+            f"aesthetic={aesthetic_enabled} mode={mode}"
+        )
+        _require_engine(engine, llm_model, aesthetic_enabled=aesthetic_enabled)
         if jlog: jlog.event("CHECK", "依赖校验通过")
 
         job.status = "hashing"
@@ -1993,6 +2019,8 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
             job.label = "正在扫描照片、计算每张图的画面指纹..."
         elif engine == "tycoon":
             job.label = "正在扫描照片、用云端视觉能力做初筛..."
+        elif engine == "local_vlm":
+            job.label = "正在扫描照片、用本机视觉模型做初筛..."
         else:
             job.label = "正在扫描照片、识别画面与人脸、评估质量..."
         infos, skipped = grouper.compute_infos(
@@ -2004,6 +2032,7 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
             event_cb=_job_event,
             engine=engine,
             llm_model=llm_model,
+            aesthetic_enabled=aesthetic_enabled,
         )
         if _cancel_check():
             raise CancelledError()
@@ -2032,9 +2061,15 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
                 LAST_INFOS = infos
             job.status = "done"
             if rejected:
-                job.label = f"初筛出 {len(rejected)} 张失败照片，等待复核"
+                if engine == "local_vlm":
+                    job.label = f"初筛淘汰 {len(rejected)} 张照片，等待复核"
+                else:
+                    job.label = f"初筛出 {len(rejected)} 张失败照片，等待复核"
             else:
-                job.label = f"扫描 {len(infos)} 张，未发现失败照片"
+                if engine == "local_vlm":
+                    job.label = f"扫描 {len(infos)} 张，未淘汰照片"
+                else:
+                    job.label = f"扫描 {len(infos)} 张，未发现失败照片"
             job.done = job.total = len(infos)
             job.finished_at = time.time()
             if jlog:
@@ -2194,13 +2229,14 @@ def api_ark_key_clear():
 
 @app.route("/api/llm_models", methods=["GET"])
 def api_llm_models():
-    """土豪模式：列出 Ark 上可用的 Seed 系列视觉模型，供前端 select。"""
-    if not os.getenv("ARK_API_KEY"):
+    """列出 LLM provider 上可用的视觉模型，供前端 select。"""
+    provider = request.args.get("provider", "ark").strip() or "ark"
+    if provider == "ark" and not os.getenv("ARK_API_KEY"):
         return jsonify({"error": "未配置 ARK API Key（请在土豪模式卡片下方点击设置）",
                         "models": []}), 412
     try:
         from pic_selecter import llm_judge
-        models = llm_judge.list_models()
+        models = llm_judge.list_models(provider=provider)
     except Exception as e:
         return jsonify({"error": str(e), "models": []}), 502
     return jsonify({"models": models})
@@ -2265,7 +2301,7 @@ def api_start():
     if mode not in ("copy", "move"):
         mode = "copy"
     engine = data.get("engine", "fast")
-    if engine not in ("fast", "expert", "tycoon"):
+    if engine not in ("fast", "expert", "tycoon", "local_vlm"):
         engine = "fast"
     llm_model = (data.get("llm_model") or "").strip() or None
     threshold_near = int(data.get("threshold_near", THRESHOLD_NEAR))
@@ -2280,6 +2316,7 @@ def api_start():
     if prescreen_strength not in ("standard", "advanced"):
         prescreen_strength = "standard"
     face_aware = bool(data.get("face_aware", True))
+    aesthetic_enabled = bool(data.get("aesthetic_enabled", True))
 
     if not folder:
         return jsonify({"error": "请填写文件夹路径"}), 400
@@ -2288,9 +2325,12 @@ def api_start():
         return jsonify({"error": f"目录不存在: {folder}"}), 400
     if engine == "tycoon" and not llm_model:
         return jsonify({"error": "土豪模式需要选择 LLM 模型"}), 400
+    if engine == "local_vlm" and not llm_model:
+        from pic_selecter import llm_judge
+        llm_model = llm_judge.default_model(provider="local_vlm")
 
     with LOCK:
-        if JOB and JOB.status in ("pending", "scanning", "hashing", "grouping"):
+        if JOB and JOB.status in ("pending", "checking", "scanning", "hashing", "grouping"):
             return jsonify({"error": "已有任务在跑，请稍候"}), 409
 
         _apply_runtime_selection(runtime)
@@ -2303,6 +2343,7 @@ def api_start():
             near_seconds=near_seconds, prescreen_enabled=prescreen_enabled,
             prescreen_strength=prescreen_strength,
             face_aware=face_aware,
+            aesthetic_enabled=aesthetic_enabled,
             llm_model=llm_model,
         )
         SESSION = None
@@ -2312,7 +2353,7 @@ def api_start():
         args=(folder, dry_run, mode, wipe_cache,
               threshold_near, threshold_far, near_seconds,
               prescreen_enabled, prescreen_strength, face_aware, engine,
-              llm_model),
+              llm_model, aesthetic_enabled),
         daemon=True,
     )
     t.start()
@@ -2370,7 +2411,11 @@ def api_job():
     except ValueError:
         since = 0
     events = [e for e in JOB.recent_events if e.get("seq", 0) > since][-30:]
-    rejected_total = sum(1 for e in JOB.recent_events if e.get("reject"))
+    rejected_running = (
+        JOB.rejected_running
+        if JOB.engine == "local_vlm"
+        else sum(1 for e in JOB.recent_events if e.get("reject"))
+    )
     return jsonify({
         "status": JOB.status,
         "folder": JOB.folder,
@@ -2379,6 +2424,7 @@ def api_job():
         "engine": JOB.engine,
         "prescreen_enabled": JOB.prescreen_enabled,
         "prescreen_strength": JOB.prescreen_strength,
+        "aesthetic_enabled": JOB.aesthetic_enabled,
         "done": JOB.done,
         "total": JOB.total,
         "label": JOB.label,
@@ -2390,7 +2436,7 @@ def api_job():
         "elapsed": (JOB.finished_at or time.time()) - (JOB.started_at or time.time()),
         "events": events,
         "event_seq": JOB.event_seq,
-        "rejected_running": rejected_total,
+        "rejected_running": rejected_running,
     })
 
 

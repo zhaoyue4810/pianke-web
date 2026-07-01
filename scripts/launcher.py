@@ -101,12 +101,14 @@ MODE_PACKAGES = {
     "fast": [],     # 极速模式所有依赖都在 CORE 里
     "expert": [],
     "tycoon": [],
+    "local_vlm": [],
 }
 
 MODE_LABELS = {
     "fast": "极速模式（纯本地，约 200MB，下载 1-3 分钟）",
     "expert": "专家模式（深度学习，约 2-3GB，下载 5-15 分钟）",
     "tycoon": "土豪模式（LLM 判图，约 5MB，需自备 API key）",
+    "local_vlm": "本地 VLM 模式（Ollama/Gemma + 本地美学模型，约 2-3GB，需本机模型服务）",
 }
 
 
@@ -168,10 +170,11 @@ def ask_modes(previous: list[str] | None) -> list[str]:
     print("第一次运行，请选择要启用的模式（可多选，逗号或空格分隔）：")
 
     print()
-    keys = ["fast", "expert", "tycoon"]
+    keys = ["fast", "expert", "tycoon", "local_vlm"]
     for i, key in enumerate(keys, 1):
         print(f"  {i}) {MODE_LABELS[key]}")
-    print(f"  4) 全部")
+    all_option = str(len(keys) + 1)
+    print(f"  {all_option}) 全部")
 
     while True:
         try:
@@ -183,13 +186,13 @@ def ask_modes(previous: list[str] | None) -> list[str]:
             print("请至少选一个。")
             continue
 
-        # 解析：支持 "1,2"、"1 2"、"123"、"4" 等
-        tokens = re.findall(r"[1-4]", raw)
+        # 解析：支持 "1,2"、"1 2"、"123"、"5" 等
+        tokens = re.findall(rf"[1-{all_option}]", raw)
         if not tokens:
-            print("无法识别，请输入 1-4 的数字。")
+            print(f"无法识别，请输入 1-{all_option} 的数字。")
             continue
 
-        if "4" in tokens:
+        if all_option in tokens:
             return keys[:]
 
         chosen = []
@@ -381,6 +384,7 @@ MODE_TIME_ESTIMATE = {
     "fast": "1-3 分钟",
     "expert": "5-15 分钟（取决于网速；torch/insightface 加起来 ~2GB）",
     "tycoon": "约 30 秒",
+    "local_vlm": "5-15 分钟（本地 VLM + NIMA/MUSIQ/CLIP-IQA 美学模型）",
 }
 
 
@@ -476,20 +480,20 @@ def _ensure_opencv_single() -> None:
 def packages_for_modes(modes: list[str]) -> list[str]:
     """返回 CORE + 选中模式的额外包。任何模式都会带上 CORE。"""
     seen: dict[str, None] = {pkg: None for pkg in CORE_PACKAGES}
-    if any(m in {"expert", "tycoon"} for m in modes):
+    if any(m in {"expert", "tycoon", "local_vlm"} for m in modes):
         for pkg in VISION_BASE_PACKAGES:
             seen[pkg] = None
-    if "expert" in modes:
+    if any(m in {"expert", "local_vlm"} for m in modes):
         for pkg in VISION_EXPERT_PACKAGES:
             seen[pkg] = None
-    if "tycoon" in modes:
+    if any(m in {"tycoon", "local_vlm"} for m in modes):
         for pkg in LLM_PACKAGES:
             seen[pkg] = None
     return list(seen.keys())
 
 
 def wants_cuda_backend(modes: list[str], runtime: str = "auto") -> bool:
-    if not any(m in {"expert", "tycoon"} for m in modes):
+    if not any(m in {"expert", "tycoon", "local_vlm"} for m in modes):
         return False
     if os.environ.get("PIANKE_FORCE_CPU", "0") == "1":
         return False
@@ -507,7 +511,7 @@ def pip_uninstall(packages: list[str]) -> None:
 
 
 def ensure_runtime_backends(modes: list[str], runtime: str = "auto") -> str:
-    if not any(m in {"expert", "tycoon"} for m in modes):
+    if not any(m in {"expert", "tycoon", "local_vlm"} for m in modes):
         return "none"
     if wants_cuda_backend(modes, runtime):
         info(f"检测到 NVIDIA GPU，安装 CUDA 版 PyTorch（{PYTORCH_CUDA_FLAVOR}）+ ONNX Runtime GPU")
@@ -539,7 +543,7 @@ def ensure_dependencies(modes: list[str], install: dict, force: bool) -> None:
     runtime = (install.get("runtime") or "auto").strip().lower()
     packages = packages_for_modes(modes)
     backend_sig = "none"
-    if any(m in {"expert", "tycoon"} for m in modes):
+    if any(m in {"expert", "tycoon", "local_vlm"} for m in modes):
         backend_sig = f"vision:{'cuda' if wants_cuda_backend(modes, runtime) else 'cpu'}:{PYTORCH_CUDA_FLAVOR}"
     sig = "|".join(sorted(packages + [backend_sig]))
     last_sig = install.get("packages_sig")
