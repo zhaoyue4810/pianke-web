@@ -1,6 +1,6 @@
-"""火山引擎 Ark 视觉大模型客户端——土豪模式专用。
+"""视觉大模型客户端——土豪模式 / 本地 VLM 模式专用。
 
-Ark 提供 OpenAI 兼容 API，所以这里用 `openai` SDK 直接调，不绑死 volcengine SDK。
+Ark 和 Ollama 本地 OpenAI-compatible 服务都可以用 `openai` SDK 直接调。
 
 设计原则：
 - **不静默降级**：缺 API Key、模型不可用、连续重试失败 → 抛 LLMJudgeError，
@@ -14,6 +14,9 @@ Ark 提供 OpenAI 兼容 API，所以这里用 `openai` SDK 直接调，不绑�
   ARK_MAX_WORKERS — ThreadPool 上限 + 自适应限速 ceiling，默认 20
   ARK_INITIAL_CONCURRENCY — 初始并发数，默认 10
   ARK_TIMEOUT     — 单次请求超时秒，默认 30
+  LOCAL_VLM_BASE_URL — 默认 http://127.0.0.1:11434/v1
+  LOCAL_VLM_MODEL    — 默认 gemma4:12b
+  LOCAL_VLM_API_KEY  — 默认 ollama（Ollama 不校验，但 OpenAI SDK 需要非空）
 
 模型 ID 不写在环境变量里——由前端从 list_models() 拉取后用户选定，传给 judge_image。
 """
@@ -27,6 +30,7 @@ import logging
 import os
 import threading
 import time
+import urllib.request
 from typing import Optional
 
 from PIL import Image
@@ -34,6 +38,11 @@ from PIL import Image
 logger = logging.getLogger("pic_selecter")
 
 DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+DEFAULT_LOCAL_BASE_URL = "http://127.0.0.1:11434/v1"
+DEFAULT_LOCAL_MODEL = "gemma4:12b"
+
+PROVIDER_ARK = "ark"
+PROVIDER_LOCAL_VLM = "local_vlm"
 
 # ============================================================
 # Prompt v5：两套档位，标准 / 进阶，由 prescreen_strength 路由
@@ -430,6 +439,8 @@ class RateLimitError(LLMJudgeError):
 
 _CLIENT_LOCK = threading.Lock()
 _CLIENT = None
+_CLIENT_PROVIDER: Optional[str] = None
+_CLIENT_BASE_URL: Optional[str] = None
 _MODELS_CACHE: dict = {"at": 0.0, "data": None}
 _MODELS_CACHE_TTL = 300.0  # 5 分钟
 
@@ -516,19 +527,65 @@ def current_concurrency() -> int:
     return _LIMITER.current_limit
 
 
-def _api_key() -> str:
+def normalize_provider(provider: Optional[str]) -> str:
+    provider = (provider or PROVIDER_ARK).strip().lower()
+    if provider in {"local", "local-vlm", "ollama"}:
+        return PROVIDER_LOCAL_VLM
+    if provider in {PROVIDER_ARK, PROVIDER_LOCAL_VLM}:
+        return provider
+    raise LLMJudgeError(f"未知 LLM provider: {provider!r}")
+
+
+def default_model(provider: Optional[str] = PROVIDER_ARK) -> Optional[str]:
+    provider = normalize_provider(provider)
+    if provider == PROVIDER_LOCAL_VLM:
+        return os.getenv("LOCAL_VLM_MODEL", DEFAULT_LOCAL_MODEL).strip() or DEFAULT_LOCAL_MODEL
+    return None
+
+
+def _base_url(provider: str) -> str:
+    if provider == PROVIDER_LOCAL_VLM:
+        return os.getenv("LOCAL_VLM_BASE_URL", DEFAULT_LOCAL_BASE_URL).strip() or DEFAULT_LOCAL_BASE_URL
+    return os.getenv("ARK_BASE_URL", DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
+
+
+def _provider_label(provider: str) -> str:
+    return "本地 VLM" if provider == PROVIDER_LOCAL_VLM else "Ark"
+
+
+def _ollama_api_base() -> str:
+    base = _base_url(PROVIDER_LOCAL_VLM).rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return base
+
+
+def _ollama_tags_url() -> str:
+    explicit = os.getenv("LOCAL_VLM_TAGS_URL", "").strip()
+    if explicit:
+        return explicit
+    return f"{_ollama_api_base()}/api/tags"
+
+
+def _api_key(provider: str = PROVIDER_ARK) -> str:
+    provider = normalize_provider(provider)
+    if provider == PROVIDER_LOCAL_VLM:
+        # Ollama 的 OpenAI-compatible API 不校验 key，但 openai SDK 需要非空。
+        return os.getenv("LOCAL_VLM_API_KEY", "ollama").strip() or "ollama"
     key = os.getenv("ARK_API_KEY", "").strip()
     if not key:
         raise LLMJudgeError("ARK_API_KEY 未设置，请配置火山引擎 API Key 后重试")
     return key
 
 
-def _client():
-    global _CLIENT
-    if _CLIENT is not None:
+def _client(provider: str = PROVIDER_ARK):
+    global _CLIENT, _CLIENT_PROVIDER, _CLIENT_BASE_URL
+    provider = normalize_provider(provider)
+    base_url = _base_url(provider)
+    if _CLIENT is not None and _CLIENT_PROVIDER == provider and _CLIENT_BASE_URL == base_url:
         return _CLIENT
     with _CLIENT_LOCK:
-        if _CLIENT is not None:
+        if _CLIENT is not None and _CLIENT_PROVIDER == provider and _CLIENT_BASE_URL == base_url:
             return _CLIENT
         try:
             from openai import OpenAI
@@ -536,10 +593,12 @@ def _client():
             raise LLMJudgeError(
                 f"openai SDK 未安装：{e}。请 pip install openai>=1.40"
             ) from e
-        base_url = os.getenv("ARK_BASE_URL", DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
-        timeout = float(os.getenv("ARK_TIMEOUT", "30"))
-        _CLIENT = OpenAI(api_key=_api_key(), base_url=base_url, timeout=timeout)
-        logger.info(f"llm_judge: Ark 客户端初始化，base_url={base_url}")
+        timeout_env = "LOCAL_VLM_TIMEOUT" if provider == PROVIDER_LOCAL_VLM else "ARK_TIMEOUT"
+        timeout = float(os.getenv(timeout_env, "30"))
+        _CLIENT = OpenAI(api_key=_api_key(provider), base_url=base_url, timeout=timeout)
+        _CLIENT_PROVIDER = provider
+        _CLIENT_BASE_URL = base_url
+        logger.info(f"llm_judge: {_provider_label(provider)} 客户端初始化，base_url={base_url}")
     return _CLIENT
 
 
@@ -555,67 +614,126 @@ def _tier_of(model_id: str) -> str:
     return "other"
 
 
-def list_models() -> list[dict]:
-    """拉取 Ark 上可用的视觉模型，过滤 Seed 系列并按 tier 排序。
+def _list_ollama_vision_models() -> list[dict]:
+    req = urllib.request.Request(
+        _ollama_tags_url(),
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    timeout = float(os.getenv("LOCAL_VLM_TIMEOUT", "180"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        raise LLMJudgeError(f"调用本地 Ollama /api/tags 失败：{type(e).__name__}: {e}") from e
+
+    out: list[dict] = []
+    for item in data.get("models", []) or []:
+        if not isinstance(item, dict):
+            continue
+        mid = str(item.get("model") or item.get("name") or "").strip()
+        if not mid:
+            continue
+        capabilities = {str(c).lower() for c in (item.get("capabilities") or [])}
+        if "vision" not in capabilities:
+            continue
+        out.append({
+            "id": mid,
+            "tier": "local",
+            "label": f"{mid}（本地）",
+        })
+
+    preferred = default_model(PROVIDER_LOCAL_VLM)
+    out.sort(key=lambda x: (0 if x["id"] == preferred else 1, x["id"]))
+    return out
+
+
+def list_models(provider: str = PROVIDER_ARK) -> list[dict]:
+    """拉取 provider 上可用的视觉模型。
 
     返回格式：[{"id", "tier", "label", "context"}]。
     带 5 分钟进程缓存（避免每次 landing 都打 API）。
     """
+    provider = normalize_provider(provider)
+    cache_key = f"{provider}:{_base_url(provider)}:{default_model(provider) or ''}"
     now = time.time()
-    if _MODELS_CACHE["data"] is not None and (now - _MODELS_CACHE["at"]) < _MODELS_CACHE_TTL:
+    if (_MODELS_CACHE.get("data") is not None
+            and _MODELS_CACHE.get("key") == cache_key
+            and (now - _MODELS_CACHE["at"]) < _MODELS_CACHE_TTL):
         return _MODELS_CACHE["data"]
 
-    try:
-        client = _client()
-        resp = client.models.list()
-    except LLMJudgeError:
-        raise
-    except Exception as e:
-        raise LLMJudgeError(f"调用 Ark /models 失败：{type(e).__name__}: {e}") from e
+    if provider == PROVIDER_LOCAL_VLM:
+        out = _list_ollama_vision_models()
+    else:
+        try:
+            client = _client(provider)
+            resp = client.models.list()
+        except LLMJudgeError:
+            raise
+        except Exception as e:
+            raise LLMJudgeError(f"调用 {_provider_label(provider)} /models 失败：{type(e).__name__}: {e}") from e
 
-    out: list[dict] = []
-    for m in getattr(resp, "data", []) or []:
-        mid = getattr(m, "id", "") or ""
-        if not mid:
-            continue
-        # 只保留 Seed 系列视觉模型（doubao-seed-* 或包含 vision 的）
-        low = mid.lower()
-        is_seed = "seed" in low or "doubao" in low
-        is_vision = "vision" in low or "vl" in low or "seed" in low
-        if not (is_seed and is_vision):
-            continue
-        tier = _tier_of(mid)
-        out.append({
-            "id": mid,
-            "tier": tier,
-            "label": mid,
-        })
+        out = []
+        for m in getattr(resp, "data", []) or []:
+            mid = getattr(m, "id", "") or ""
+            if not mid:
+                continue
+            # 只保留 Seed 系列视觉模型（doubao-seed-* 或包含 vision 的）
+            low = mid.lower()
+            is_seed = "seed" in low or "doubao" in low
+            is_vision = "vision" in low or "vl" in low or "seed" in low
+            if not (is_seed and is_vision):
+                continue
+            tier = _tier_of(mid)
+            out.append({
+                "id": mid,
+                "tier": tier,
+                "label": mid,
+            })
 
-    # 排序：pro > lite > mini > other；同 tier 内按 id
-    tier_order = {"pro": 0, "lite": 1, "mini": 2, "other": 3}
-    out.sort(key=lambda x: (tier_order.get(x["tier"], 9), x["id"]))
+    if provider == PROVIDER_LOCAL_VLM:
+        preferred = default_model(provider)
+        out.sort(key=lambda x: (0 if x["id"] == preferred else 1, x["id"]))
+    else:
+        # 排序：pro > lite > mini > other；同 tier 内按 id
+        tier_order = {"pro": 0, "lite": 1, "mini": 2, "other": 3}
+        out.sort(key=lambda x: (tier_order.get(x["tier"], 9), x["id"]))
 
     if not out:
-        # API 返回不含 Seed 视觉模型——可能账号未开通；给个明确提示
-        logger.warning("llm_judge: /models 未返回 Seed 系列视觉模型——账号可能未开通")
+        if provider == PROVIDER_LOCAL_VLM:
+            logger.warning("llm_judge: 本地 VLM /models 未返回模型——请确认 Ollama 已启动并已 pull 模型")
+        else:
+            # API 返回不含 Seed 视觉模型——可能账号未开通；给个明确提示
+            logger.warning("llm_judge: /models 未返回 Seed 系列视觉模型——账号可能未开通")
 
     _MODELS_CACHE["at"] = now
     _MODELS_CACHE["data"] = out
+    _MODELS_CACHE["key"] = cache_key
     return out
 
 
-def require_llm_capabilities() -> None:
-    """启动期校验：API Key 存在 + 一次 list_models() 成功。"""
-    _api_key()  # 抛 LLMJudgeError 如未设
+def require_llm_capabilities(provider: str = PROVIDER_ARK,
+                             model: Optional[str] = None) -> None:
+    """启动期校验：provider 连通 + 所需模型存在。"""
+    provider = normalize_provider(provider)
+    _api_key(provider)  # Ark 会抛缺 key；本地 VLM 会返回 SDK 占位 key
     try:
-        models = list_models()
+        models = list_models(provider=provider)
     except LLMJudgeError:
         raise
     except Exception as e:
-        raise LLMJudgeError(f"Ark 连通性校验失败：{type(e).__name__}: {e}") from e
+        raise LLMJudgeError(f"{_provider_label(provider)} 连通性校验失败：{type(e).__name__}: {e}") from e
     if not models:
+        if provider == PROVIDER_LOCAL_VLM:
+            raise LLMJudgeError("本地 VLM 未返回可用模型，请确认 Ollama 已启动并已安装 gemma4:12b")
         raise LLMJudgeError("Ark 账号无可用的 Seed 系列视觉模型，请检查账号权限")
-    logger.info(f"llm_judge: 校验通过，{len(models)} 个 Seed 视觉模型可用")
+    required = (model or default_model(provider) or "").strip()
+    if required and required not in {m["id"] for m in models}:
+        raise LLMJudgeError(
+            f"{_provider_label(provider)} 未返回模型 {required!r}，"
+            f"请先安装/选择该模型"
+        )
+    logger.info(f"llm_judge: {_provider_label(provider)} 校验通过，{len(models)} 个视觉模型可用")
 
 
 def _image_to_data_url(
@@ -666,6 +784,75 @@ def _image_to_data_url(
     return f"data:image/jpeg;base64,{b64}", len(raw), img.size
 
 
+def _ollama_chat_url() -> str:
+    explicit = os.getenv("LOCAL_VLM_CHAT_URL", "").strip()
+    if explicit:
+        return explicit
+    return f"{_ollama_api_base()}/api/chat"
+
+
+def _int_env(name: str, default: int, *, min_value: int = 1, max_value: int = 1_000_000) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(min_value, min(value, max_value))
+
+
+def _ollama_native_chat(model: str, prompt_text: str, data_url: str, max_tokens: int) -> str:
+    try:
+        image_b64 = data_url.split(",", 1)[1]
+    except IndexError as e:
+        raise LLMJudgeError("本地 VLM 图片 data URL 格式非法") from e
+
+    payload = {
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": prompt_text,
+            "images": [image_b64],
+        }],
+        "stream": False,
+        "format": "json",
+        # Gemma 4 defaults to thinking. On Ollama this can consume the whole
+        # generation budget and leave message.content empty.
+        "think": False,
+        "options": {
+            "temperature": 0.0,
+            "num_predict": max_tokens,
+            "num_ctx": _int_env("LOCAL_VLM_NUM_CTX", 8192, min_value=2048, max_value=262144),
+        },
+    }
+    req = urllib.request.Request(
+        _ollama_chat_url(),
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    timeout = float(os.getenv("LOCAL_VLM_TIMEOUT", "180"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except LLMJudgeError:
+        raise
+    except Exception as e:
+        raise LLMJudgeError(f"调用本地 Ollama /api/chat 失败：{type(e).__name__}: {e}") from e
+
+    msg = data.get("message") or {}
+    content = (msg.get("content") or "").strip()
+    if not content:
+        reason = data.get("done_reason") or data.get("done")
+        thinking = (msg.get("thinking") or msg.get("reasoning") or "")[:120]
+        detail = f" done_reason={reason!r}" if reason else ""
+        if thinking:
+            detail += f" thinking={thinking!r}"
+        raise LLMJudgeError(f"本地 VLM 返回空 content{detail}")
+    return content
+
+
 def _is_rate_limit_exc(exc: BaseException) -> bool:
     """判定是否是限流类错误。
 
@@ -691,7 +878,8 @@ def _is_rate_limit_exc(exc: BaseException) -> bool:
 
 
 def judge_image(pil_img: Image.Image, model: str,
-                strength: str = "standard") -> dict:
+                strength: str = "standard",
+                provider: str = PROVIDER_ARK) -> dict:
     """对单张图调 LLM 拿初筛判定。
 
     strength: "standard"（默认，温和）/ "advanced"（严苛）→ 路由到不同 prompt。
@@ -703,12 +891,17 @@ def judge_image(pil_img: Image.Image, model: str,
     - 429 / 限流：通知 _LIMITER 减半并发；本次等 backoff*2 再试，最多 4 次
     - 5xx / 网络错误：等 backoff 再试，最多 3 次
     """
+    provider = normalize_provider(provider)
     if not model:
         raise LLMJudgeError("judge_image: 必须传入 model（从 list_models() 选）")
 
-    client = _client()
+    client = None if provider == PROVIDER_LOCAL_VLM else _client(provider)
     data_url, img_bytes, img_size = _image_to_data_url(pil_img)
     prompt_text = _prompt_for(strength)
+    max_tokens = (
+        _int_env("LOCAL_VLM_NUM_PREDICT", 128, min_value=32, max_value=512)
+        if provider == PROVIDER_LOCAL_VLM else 384
+    )
 
     messages = [
         {
@@ -729,23 +922,28 @@ def judge_image(pil_img: Image.Image, model: str,
         for attempt, backoff in enumerate(backoffs, start=1):
             try:
                 t0 = time.time()
-                resp = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=0.0,
-                    max_tokens=384,
+                kwargs = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": 0.0,
+                    "max_tokens": max_tokens,
+                }
+                if provider == PROVIDER_ARK:
                     # 关闭 doubao-seed-1.6 系列的 thinking 模式——质检场景不需要思考链，
                     # 开了单张要 10s+，关了 2-4s
-                    extra_body={"thinking": {"type": "disabled"}},
-                )
+                    kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+                if provider == PROVIDER_LOCAL_VLM:
+                    content = _ollama_native_chat(model, prompt_text, data_url, max_tokens)
+                else:
+                    resp = client.chat.completions.create(**kwargs)
+                    content = (resp.choices[0].message.content or "").strip()
                 elapsed = time.time() - t0
                 logger.info(
-                    f"llm_judge: {model} {img_size[0]}x{img_size[1]} "
+                    f"llm_judge: {_provider_label(provider)} {model} {img_size[0]}x{img_size[1]} "
                     f"{img_bytes/1024:.0f}KB → {elapsed:.1f}s"
                 )
-                content = (resp.choices[0].message.content or "").strip()
                 if not content:
-                    raise LLMJudgeError("Ark 返回空 content")
+                    raise LLMJudgeError(f"{_provider_label(provider)} 返回空 content")
                 # 容错：模型偶尔会用 markdown 代码块包 JSON
                 if content.startswith("```"):
                     lines = content.split("\n")
@@ -778,21 +976,21 @@ def judge_image(pil_img: Image.Image, model: str,
                 if attempt < len(backoffs):
                     wait = backoff * (2.0 if is_rate else 1.0)
                     logger.warning(
-                        f"llm_judge: Ark {'限流' if is_rate else '调用失败'}"
+                        f"llm_judge: {_provider_label(provider)} {'限流' if is_rate else '调用失败'}"
                         f"（尝试 {attempt}/{len(backoffs)}）：{etype}: {e}，{wait:.1f}s 后重试"
                     )
                     time.sleep(wait)
                 else:
                     logger.error(
-                        f"llm_judge: Ark 调用 {len(backoffs)} 次均失败：{etype}: {e}"
+                        f"llm_judge: {_provider_label(provider)} 调用 {len(backoffs)} 次均失败：{etype}: {e}"
                     )
 
         if last_err is not None and _is_rate_limit_exc(last_err):
             raise RateLimitError(
-                f"Ark 限流重试 {len(backoffs)} 次仍失败：{last_err}"
+                f"{_provider_label(provider)} 限流重试 {len(backoffs)} 次仍失败：{last_err}"
             )
         raise LLMJudgeError(
-            f"Ark 调用重试 {len(backoffs)} 次仍失败："
+            f"{_provider_label(provider)} 调用重试 {len(backoffs)} 次仍失败："
             f"{type(last_err).__name__}: {last_err}"
         )
     finally:

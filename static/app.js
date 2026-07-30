@@ -274,13 +274,24 @@ function syncPrescreenStrength() {
 $("opt-prescreen").addEventListener("change", syncPrescreenStrength);
 syncPrescreenStrength();
 
-// 模式切换：联动 .is-active 视觉态 + 联动 face_aware 可用性 + 土豪模式模型选择
+function syncLocalVlmAestheticToggle() {
+  const row = $("local-vlm-aesthetic-row");
+  const opt = $("opt-local-vlm-aesthetic");
+  if (!row || !opt) return;
+  const on = currentEngine() === "local_vlm";
+  row.hidden = !on;
+  opt.disabled = !on;
+}
+syncLocalVlmAestheticToggle();
+
+// 模式切换：联动 .is-active 视觉态 + 联动 face_aware 可用性 + VLM 模型选择
 function syncEngineSwitch() {
   const engine = currentEngine();
   document.querySelectorAll(".engine-opt").forEach(el => {
     el.classList.toggle("is-active", el.dataset.engine === engine);
   });
   syncPrescreenStrength();
+  syncLocalVlmAestheticToggle();
   syncTycoonPicker(engine);
 }
 document.querySelectorAll('input[name="engine"]').forEach(el => {
@@ -297,19 +308,55 @@ document.querySelectorAll(".engine-opt").forEach(el => {
   });
 });
 
-// ---------- 土豪模式模型选择 + API Key 管理 ----------
-let llmModelsLoaded = false;
+// ---------- 云端/本地 VLM 模型选择 + API Key 管理 ----------
+let llmModelsLoadedProvider = null;
 let arkKeyConfigured = false;
+
+function currentLlmProvider() {
+  return currentEngine() === "local_vlm" ? "local_vlm" : "ark";
+}
+
+function llmStorageKey(provider) {
+  return `pic_selecter.llm_model.${provider}`;
+}
+
+function syncLlmPickerCopy(provider) {
+  const label = $("llm-model-label");
+  const refresh = $("llm-model-refresh");
+  if (provider === "local_vlm") {
+    if (label) label.textContent = "选择本地模型";
+    if (refresh) refresh.title = "重新拉取本地模型列表";
+  } else {
+    if (label) label.textContent = "选择云端视觉能力";
+    if (refresh) refresh.title = "重新拉取列表";
+  }
+}
 
 function syncTycoonPicker(engine) {
   const picker = $("tycoon-model-picker");
   if (!picker) return;
-  if (engine === "tycoon") {
+  if (engine === "tycoon" || engine === "local_vlm") {
     picker.hidden = false;
-    refreshArkKeyStatus();  // 每次切到土豪都查一遍 key 状态
+    if (engine === "local_vlm") {
+      syncLlmPickerCopy("local_vlm");
+      syncLocalVlmStatus();
+    } else {
+      syncLlmPickerCopy("ark");
+      refreshArkKeyStatus();  // 每次切到土豪都查一遍 key 状态
+    }
   } else {
     picker.hidden = true;
   }
+}
+
+function syncLocalVlmStatus() {
+  const badge = $("tycoon-key-badge");
+  const btn = $("tycoon-key-btn");
+  const edit = $("tycoon-key-edit");
+  if (badge) badge.innerHTML = `<span class="tycoon-key-ok">●</span> 本地 Ollama`;
+  if (btn) btn.hidden = true;
+  if (edit) edit.hidden = true;
+  loadLlmModels("local_vlm");
 }
 
 async function refreshArkKeyStatus() {
@@ -317,6 +364,7 @@ async function refreshArkKeyStatus() {
   const btn = $("tycoon-key-btn");
   const select = $("llm-model-select");
   if (!badge) return;
+  if (btn) btn.hidden = false;
   try {
     const r = await fetch("/api/ark_key");
     const data = await r.json();
@@ -326,11 +374,11 @@ async function refreshArkKeyStatus() {
       badge.innerHTML = `<span class="tycoon-key-ok">●</span> Key 已配置 <span class="tycoon-key-mask">${data.masked || ""}</span> <span class="tycoon-key-src">${src}</span>`;
       btn.textContent = "修改";
       // 自动加载模型
-      if (!llmModelsLoaded) loadLlmModels();
+      if (llmModelsLoadedProvider !== "ark") loadLlmModels("ark");
     } else {
       badge.innerHTML = `<span class="tycoon-key-warn">●</span> 未配置 API Key`;
       btn.textContent = "设置 Key";
-      llmModelsLoaded = false;
+      llmModelsLoadedProvider = null;
       if (select) {
         select.innerHTML = '<option value="">请先配置 API Key</option>';
       }
@@ -363,7 +411,7 @@ async function saveArkKey() {
     // 成功：关闭录入面板、清空输入、刷新状态
     if (input) input.value = "";
     $("tycoon-key-edit").hidden = true;
-    llmModelsLoaded = false;
+    llmModelsLoadedProvider = null;
     await refreshArkKeyStatus();
     setStatus(`✓ Key 已保存（${data.model_count} 个模型可用）`, "idle");
   } catch (e) {
@@ -377,7 +425,7 @@ async function clearArkKey() {
   if (!confirm("清除 API Key？\n\n本地存储的 key 会被删掉，需要重新输入才能用土豪模式。")) return;
   try {
     await fetch("/api/ark_key", { method: "DELETE" });
-    llmModelsLoaded = false;
+    llmModelsLoadedProvider = null;
     await refreshArkKeyStatus();
   } catch (e) {
     setStatus(`清除失败：${e.message}`, "error");
@@ -421,33 +469,38 @@ if (keyInput) {
     if (e.key === "Enter") { e.preventDefault(); saveArkKey(); }
   });
 }
-async function loadLlmModels() {
+async function loadLlmModels(provider = currentLlmProvider()) {
   const select = $("llm-model-select");
   const hint = $("tycoon-hint");
   if (!select) return;
+  syncLlmPickerCopy(provider);
   select.innerHTML = '<option value="">加载中...</option>';
   try {
-    const r = await fetch("/api/llm_models");
+    const r = await fetch(`/api/llm_models?provider=${encodeURIComponent(provider)}`);
     const data = await r.json();
     if (!r.ok) {
       select.innerHTML = '<option value="">不可用</option>';
-      hint.textContent = `× ${data.error || "拉取模型列表失败"}。请设置 ARK_API_KEY 后重启服务。`;
+      hint.textContent = provider === "local_vlm"
+        ? `× ${data.error || "拉取本地模型列表失败"}。请确认 Ollama 已启动并已安装 gemma4:12b。`
+        : `× ${data.error || "拉取模型列表失败"}。请设置 ARK_API_KEY 后重启服务。`;
       hint.classList.add("tycoon-hint-error");
       return;
     }
     const models = data.models || [];
     if (!models.length) {
       select.innerHTML = '<option value="">无可用模型</option>';
-      hint.textContent = "× Ark 账号未返回 Seed 系列视觉模型，请到火山引擎控制台开通。";
+      hint.textContent = provider === "local_vlm"
+        ? "× 本地模型服务未返回模型，请先运行 ollama run gemma4:12b。"
+        : "× Ark 账号未返回 Seed 系列视觉模型，请到火山引擎控制台开通。";
       hint.classList.add("tycoon-hint-error");
       return;
     }
-    // 按 tier 分组：pro / lite / mini / other
-    const groups = { pro: [], lite: [], mini: [], other: [] };
+    // 按 tier 分组：local / pro / lite / mini / other
+    const groups = { local: [], pro: [], lite: [], mini: [], other: [] };
     models.forEach(m => { (groups[m.tier] || groups.other).push(m); });
-    const tierName = { pro: "Pro（高质量）", lite: "Lite（平衡）", mini: "Mini（轻量便宜）", other: "其他" };
+    const tierName = { local: "本地模型", pro: "Pro（高质量）", lite: "Lite（平衡）", mini: "Mini（轻量便宜）", other: "其他" };
     select.innerHTML = "";
-    for (const tier of ["pro", "lite", "mini", "other"]) {
+    for (const tier of ["local", "pro", "lite", "mini", "other"]) {
       const arr = groups[tier];
       if (!arr.length) continue;
       const optgroup = document.createElement("optgroup");
@@ -460,9 +513,10 @@ async function loadLlmModels() {
       });
       select.appendChild(optgroup);
     }
-    // 默认选中：优先 localStorage；否则 doubao-seed-2-0-lite-260428；再降级 mini 最新
-    const saved = localStorage.getItem("pic_selecter.llm_model");
-    const preferred = "doubao-seed-2-0-mini-260428";
+    // 默认选中：本地 VLM 优先 gemma4:12b；Ark 优先 mini Seed。
+    const legacySaved = provider === "ark" ? localStorage.getItem("pic_selecter.llm_model") : "";
+    const saved = localStorage.getItem(llmStorageKey(provider)) || legacySaved;
+    const preferred = provider === "local_vlm" ? "gemma4:12b" : "doubao-seed-2-0-mini-260428";
     const allOptions = [...select.options];
     if (saved && allOptions.some(o => o.value === saved)) {
       select.value = saved;
@@ -471,9 +525,11 @@ async function loadLlmModels() {
     } else if (groups.mini.length) {
       select.value = groups.mini[groups.mini.length - 1].id;
     }
-    hint.textContent = "已就绪。图片会上传至火山引擎服务器，按 token 计费。";
+    hint.textContent = provider === "local_vlm"
+      ? "已就绪。图片只会发送到本机 Ollama 服务，不上传云端。"
+      : "已就绪。图片会上传至火山引擎服务器，按 token 计费。";
     hint.classList.remove("tycoon-hint-error");
-    llmModelsLoaded = true;
+    llmModelsLoadedProvider = provider;
   } catch (e) {
     select.innerHTML = '<option value="">网络错误</option>';
     hint.textContent = `× ${e.message || "拉取失败"}`;
@@ -483,13 +539,17 @@ async function loadLlmModels() {
 const llmSelect = $("llm-model-select");
 if (llmSelect) {
   llmSelect.addEventListener("change", () => {
-    if (llmSelect.value) localStorage.setItem("pic_selecter.llm_model", llmSelect.value);
+    if (llmSelect.value) {
+      const provider = currentLlmProvider();
+      localStorage.setItem(llmStorageKey(provider), llmSelect.value);
+      if (provider === "ark") localStorage.setItem("pic_selecter.llm_model", llmSelect.value);
+    }
   });
 }
 const llmRefreshBtn = $("llm-model-refresh");
 if (llmRefreshBtn) {
   llmRefreshBtn.addEventListener("click", () => {
-    llmModelsLoaded = false;
+    llmModelsLoadedProvider = null;
     loadLlmModels();
   });
 }
@@ -619,6 +679,7 @@ async function handleStart(e) {
   const prescreen_strength = document.querySelector('input[name="prescreen-strength"]:checked')?.value || "standard";
   // 极速模式后端会强制忽略 face_aware，这里也明确传 false 避免歧义
   const face_aware = engine === "expert" && $("opt-face-aware").checked;
+  const aesthetic_enabled = engine !== "local_vlm" || $("opt-local-vlm-aesthetic")?.checked !== false;
   const threshold_near = parseInt($("thr-near").value);
   const threshold_far = parseInt($("thr-far").value);
   const near_seconds = parseInt($("thr-near-secs").value) * 60;
@@ -643,11 +704,16 @@ async function handleStart(e) {
 
   $("start-btn").disabled = true;
   try {
-    const llm_model = engine === "tycoon"
+    const llm_model = (engine === "tycoon" || engine === "local_vlm")
       ? ($("llm-model-select")?.value || "")
       : "";
     if (engine === "tycoon" && !llm_model) {
       setStatus("请先选择一个 LLM 模型再开始", "error");
+      $("start-btn").disabled = false;
+      return;
+    }
+    if (engine === "local_vlm" && !llm_model) {
+      setStatus("请先选择一个本地 VLM 模型再开始", "error");
       $("start-btn").disabled = false;
       return;
     }
@@ -657,6 +723,7 @@ async function handleStart(e) {
         folder, dry_run, wipe_cache, mode, engine, runtime,
         threshold_near, threshold_far, near_seconds,
         prescreen_enabled, prescreen_strength, face_aware,
+        aesthetic_enabled,
         llm_model,
       }),
     });
@@ -711,11 +778,15 @@ function enterProcessing(folder) {
   $("progress-count").textContent = "—";
   $("progress-pct").textContent = "—";
   $("progress-label").textContent = "扫描文件夹…";
-  // 专家/土豪模式首次运行要先装本地依赖，进度条会停一段时间 —— 给个温和的提示
+  // 专家/LLM 模式首次运行要先装本地依赖，进度条会停一段时间 —— 给个温和的提示
   const hint = document.getElementById("first-run-hint");
   if (hint) {
     const eng = currentEngine();
-    hint.classList.toggle("hidden", !(eng === "expert" || eng === "tycoon"));
+    hint.classList.toggle("hidden", !(eng === "expert" || eng === "tycoon" || eng === "local_vlm"));
+  }
+  const rejectCap = $("proc-counter-rejected-cap");
+  if (rejectCap) {
+    rejectCap.textContent = currentEngine() === "local_vlm" ? "已淘汰" : "检出失败";
   }
   $("proc-eta").textContent = "";
   $("proc-counter-scanned").textContent = "0";
@@ -1028,7 +1099,7 @@ async function refreshJob() {
       streamSeq = ev.seq;
     }
   }
-  // 实时检出失败计数
+  // 实时已淘汰计数（本地 VLM）/ 检出失败计数（其他模式）
   if (typeof j.rejected_running === "number") {
     bumpCounter("proc-counter-rejected", j.rejected_running);
   }

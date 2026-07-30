@@ -49,6 +49,11 @@
             <span class="engine-title">土豪模式 ¥</span>
             <span class="engine-desc">用人话告诉你"为什么退这张" · 每张图 1-3 秒 · 需自备 Key</span>
           </label>
+          <label class="engine-opt" data-engine="local_vlm">
+            <input type="radio" name="engine" value="local_vlm">
+            <span class="engine-title">本地 VLM</span>
+            <span class="engine-desc">本机 Gemma 判图 · 默认 gemma4:12b · 照片不上传</span>
+          </label>
         </div>
         <div id="tycoon-model-picker" class="tycoon-model-picker" hidden>
           <!-- API Key 状态条 -->
@@ -70,8 +75,8 @@
               申请，开通视觉能力后把 Key 复制粘贴进来。Key 仅本地保存在 <code>~/.config/pic_selecter/ark_key</code>（仅你可读）。
             </p>
           </div>
-          <!-- 视觉能力选择 -->
-          <label class="field-label" for="llm-model-select">选择视觉能力</label>
+          <!-- 视觉能力 / 本地模型选择 -->
+          <label class="field-label" for="llm-model-select" id="llm-model-label">选择模型</label>
           <div class="tycoon-row">
             <select id="llm-model-select" name="llm_model">
               <option value="">加载中...</option>
@@ -149,6 +154,10 @@
               <label class="check">
                 <input type="checkbox" id="opt-face-aware" checked>
                 <span>人脸感知 · 主体锐度评估 + 闭眼检测（约 +0.3 秒/张）</span>
+              </label>
+              <label class="check" id="local-vlm-aesthetic-row" hidden>
+                <input type="checkbox" id="opt-local-vlm-aesthetic" checked>
+                <span>三套美学模型 · NIMA / MUSIQ / CLIP-IQA（默认开启，本地计算）</span>
               </label>
             </div>
 
@@ -261,7 +270,7 @@
         </div>
         <div class="proc-stat">
           <div class="proc-stat-num" id="proc-counter-rejected">0</div>
-          <div class="proc-stat-cap">检出失败</div>
+          <div class="proc-stat-cap" id="proc-counter-rejected-cap">检出失败</div>
         </div>
       </div>
     </header>

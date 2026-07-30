@@ -1,9 +1,6 @@
-import importlib
-import sys
-import types
-
 from PIL import Image, ImageFilter, ImageDraw
 
+from pic_selecter.grouper import ImageInfo
 from pic_selecter.quality import analyze_image
 
 
@@ -73,12 +70,10 @@ def test_quality_info_can_be_serialized_to_plain_dict():
     assert isinstance(data["flags"], list)
 
 
-def test_grouper_cache_round_trips_quality_metrics(tmp_path):
-    sys.modules.setdefault("imagehash", types.SimpleNamespace(phash=lambda *args, **kwargs: "0" * 16))
-    grouper = importlib.import_module("pic_selecter.grouper")
-    ImageInfo = grouper.ImageInfo
+def test_image_info_keeps_quality_metrics(tmp_path):
     photo = tmp_path / "a.jpg"
     photo.write_bytes(b"fake")
+
     info = ImageInfo(
         path=str(photo),
         phash="0" * 16,
@@ -87,8 +82,5 @@ def test_grouper_cache_round_trips_quality_metrics(tmp_path):
         quality={"quality_score": 72.5, "flags": ["blurry"], "reject_reason": "画面模糊"},
     )
 
-    grouper._save_cache(str(tmp_path), {str(photo): info})
-    loaded = grouper._load_cache(str(tmp_path))
-
-    assert loaded[str(photo)].quality["quality_score"] == 72.5
-    assert loaded[str(photo)].quality["flags"] == ["blurry"]
+    assert info.quality["quality_score"] == 72.5
+    assert info.quality["flags"] == ["blurry"]

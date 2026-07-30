@@ -9,7 +9,7 @@ import io
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -369,18 +369,63 @@ def _load_image_for_analysis(path: str, companions: list[str]) -> Image.Image:
     raise RuntimeError(f"RAW 内嵌缩略图格式不支持：{thumb.format}")
 
 
+def _is_llm_judge_error(exc: BaseException) -> bool:
+    try:
+        from pic_selecter import llm_judge
+        return isinstance(exc, llm_judge.LLMJudgeError)
+    except Exception:
+        return False
+
+
+def _format_process_error(exc: BaseException) -> str:
+    if _is_llm_judge_error(exc):
+        return f"VLM 判定失败: {exc}"
+    return f"解码失败: {type(exc).__name__}: {exc}"
+
+
+_LOCAL_VLM_HARD_SKIP_FLAGS = {
+    "very_blurry",
+    "underexposed",
+    "overexposed",
+    "low_information",
+    "too_small",
+    "tiny_file",
+}
+
+
+def _quality_get(quality: Any, key: str, default: Any = None) -> Any:
+    if isinstance(quality, dict):
+        return quality.get(key, default)
+    return getattr(quality, key, default)
+
+
+def _local_vlm_should_skip_llm(quality: Any) -> bool:
+    """Return True only for conservative local prefilter hard failures."""
+    if not _quality_get(quality, "auto_reject", False):
+        return False
+    flags = set(_quality_get(quality, "flags", []) or [])
+    return bool(flags & _LOCAL_VLM_HARD_SKIP_FLAGS)
+
+
+def _local_vlm_two_stage_enabled() -> bool:
+    return os.getenv("LOCAL_VLM_TWO_STAGE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _process_one(path: str, strength: str = "standard",
                  face_aware: bool = True,
                  engine: str = "expert",
                  llm_model: Optional[str] = None,
                  companions: Optional[list[str]] = None,
+                 aesthetic_enabled: bool = True,
                  ) -> tuple[Optional[ImageInfo], Optional[str]]:
     """返回 (info, error_reason)。失败时 info=None。
 
     engine="expert"：DINOv2 + NIMA/MUSIQ/CLIP-IQA+ 美学 + InsightFace 人脸 + 本地拒片。
     engine="fast"：零模型路径，多 hash + HSV 直方图 + ORB + fast_quality。
-    engine="tycoon"：DINOv2 + InsightFace（分组用）+ LLM 视觉判定（拒片用），
+    engine="tycoon"：DINOv2 + InsightFace（分组用）+ Ark 视觉判定（拒片用），
       llm_model 必须传入——从 list_models() 用户选定的 ID。
+    engine="local_vlm"：DINOv2 + InsightFace（分组用）+ 本地 OpenAI-compatible
+      VLM 视觉判定（拒片用），默认模型由 llm_judge.default_model() 决定。
 
     path 是 primary 文件路径（RAW 或普通图片）。companions 是同 stem 同目录的
     其它文件（RAW 时优先用其中的 JPG 做分析；任何情况下搬运时一起搬）。
@@ -436,52 +481,75 @@ def _process_one(path: str, strength: str = "standard",
                 orb_kps=orb_kps,
             ), None
 
-        if engine == "tycoon":
-            # 土豪模式：DINOv2 + InsightFace 跑分组依赖；初筛交给 LLM
-            if not llm_model:
-                return None, "tycoon 缺少 llm_model 参数"
+        if engine in ("tycoon", "local_vlm"):
+            # LLM/VLM 模式：DINOv2 + InsightFace 跑分组依赖；初筛交给视觉语言模型
             import logging as _logging
             from pic_selecter import vision
             from pic_selecter import llm_judge
             from pic_selecter.quality import analyze_basic
             from pic_selecter.fast_quality import analyze_image_fast
             _log = _logging.getLogger("pic_selecter")
+            provider = "local_vlm" if engine == "local_vlm" else "ark"
+            if not llm_model:
+                llm_model = llm_judge.default_model(provider=provider)
+            if not llm_model:
+                return None, f"{engine} 缺少 llm_model 参数"
 
             dinov2_vec = vision.extract_dinov2(img_t)
             face_data = vision.extract_faces(img_t)
             face_embs = [f["embedding"] for f in face_data]
+            aesthetic = musiq = clipiqa = None
+            if engine == "local_vlm" and aesthetic_enabled:
+                aesthetic = vision.extract_aesthetic_score(img_t)
+                musiq = vision.extract_musiq_score(img_t)
+                clipiqa = vision.extract_clipiqa_score(img_t)
 
-            # 进阶版极速预审：先用 fast_quality advanced 档拒明显废片，省下 LLM 调用。
-            # 通过的才进 LLM；被拒的直接走 fast 的 auto_reject + reject_reason，
-            # 并且不写 llm_verdict / llm_reason（UI 的 LLM 列会显示"缺失"，如实反映没调过 LLM）。
+            def _attach_local_aesthetic(qinfo):
+                if engine == "local_vlm" and aesthetic_enabled:
+                    qinfo.aesthetic_score = aesthetic
+                    qinfo.musiq_score = musiq
+                    qinfo.clipiqa_score = clipiqa
+                return qinfo
+
+            # 进阶版极速预审：Ark 路径沿用旧逻辑；本地 VLM 只让硬伤跳过 Gemma。
+            # subject_blurry / horizon_severe / score_too_low 等疑似拒片会进入 VLM 复判。
             fast_q = analyze_image_fast(img_t, st.st_size, strength="advanced")
-            if fast_q.auto_reject:
+            should_skip_llm = bool(fast_q.auto_reject)
+            if engine == "local_vlm":
+                should_skip_llm = _local_vlm_should_skip_llm(fast_q)
+            if should_skip_llm:
                 verdict = None
                 reason = None
-                quality_info = fast_q
+                quality_info = _attach_local_aesthetic(fast_q)
                 _log.info(
-                    f"[tycoon] {Path(path).name}: fast-advanced 预审拒片 "
+                    f"[{engine}] {Path(path).name}: fast-advanced 预审拒片 "
                     f"reason='{fast_q.reject_reason}' → 跳过 LLM"
                 )
             else:
+                if engine == "local_vlm" and fast_q.auto_reject:
+                    _log.info(
+                        f"[local_vlm] {Path(path).name}: fast-advanced 预审疑似拒片 "
+                        f"reason='{fast_q.reject_reason}' → VLM 复判"
+                    )
                 # LLM 判定 —— 失败 3 次后抛 LLMJudgeError，让 _run_job 接住
                 # strength 路由到 standard / advanced 两套 prompt
                 judgement = llm_judge.judge_image(
-                    img_t, model=llm_model, strength=strength,
+                    img_t, model=llm_model, strength=strength, provider=provider,
                 )
                 verdict = judgement["verdict"]
                 reason = judgement["reason"]
 
-                quality_info = analyze_basic(
+                quality_info = _attach_local_aesthetic(analyze_basic(
                     img_t, st.st_size,
                     llm_verdict=verdict,
                     llm_reason=reason,
-                )
+                ))
 
                 _log.debug(
-                    f"[tycoon] {Path(path).name}: "
+                    f"[{engine}] {Path(path).name}: "
                     f"verdict={verdict} reason='{reason}' "
-                    f"faces={len(face_embs)}"
+                    f"faces={len(face_embs)} "
+                    f"nima={aesthetic} musiq={musiq} clipiqa={clipiqa}"
                 )
 
             ts_unix = ts_dt.timestamp() if ts_dt else None
@@ -495,6 +563,9 @@ def _process_one(path: str, strength: str = "standard",
                 exif_summary=exif_sum,
                 quality=quality_info.to_dict(),
                 dinov2=dinov2_vec,
+                aesthetic_score=aesthetic,
+                musiq_score=musiq,
+                clipiqa_score=clipiqa,
                 face_embeddings=face_embs,
                 llm_verdict=verdict,
                 llm_reason=reason,
@@ -545,13 +616,271 @@ def _process_one(path: str, strength: str = "standard",
             face_embeddings=face_embs,
         ), None
     except Exception as e:
-        return None, f"解码失败: {type(e).__name__}: {e}"
+        if _is_llm_judge_error(e):
+            raise
+        return None, _format_process_error(e)
     finally:
         if img is not None:
             try:
                 img.close()
             except Exception:
                 pass
+
+
+def _local_vlm_stage1_cache_path(folder: str) -> Path:
+    return Path(folder) / "_pic_selecter" / "local_vlm_stage1_cache.pkl"
+
+
+def _write_local_vlm_stage1_cache(folder: str, infos: list[ImageInfo]) -> None:
+    import pickle
+    import time
+
+    p = _local_vlm_stage1_cache_path(folder)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "created_at": time.time(),
+        "items": infos,
+    }
+    with open(p, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _release_vision_models_for_local_vlm() -> None:
+    import gc
+    import logging as _logging
+
+    log = _logging.getLogger("pic_selecter")
+    try:
+        from pic_selecter import vision
+        vision.reset_runtime_state()
+    except Exception as e:
+        log.warning(f"[local_vlm] 释放 vision 模型缓存失败: {e}")
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    log.info("[local_vlm] 已释放 Python 侧 vision 模型缓存，准备调用 Ollama")
+
+
+def _process_local_vlm_features(path: str, strength: str = "standard",
+                                face_aware: bool = True,
+                                companions: Optional[list[str]] = None,
+                                aesthetic_enabled: bool = True
+                                ) -> tuple[Optional[ImageInfo], Optional[str]]:
+    companions = companions or []
+    img = None
+    try:
+        st = os.stat(path)
+        img = _load_image_for_analysis(path, companions)
+        ts_dt = _read_exif_datetime(img)
+        exif_sum = extract_exif_summary(img, st.st_size)
+        img_t = _resize_for_analysis(ImageOps.exif_transpose(img))
+        ph = imagehash.phash(img_t, hash_size=8)
+
+        import logging as _logging
+        from pic_selecter import vision
+        from pic_selecter.fast_quality import analyze_image_fast
+
+        dinov2_vec = vision.extract_dinov2(img_t)
+        face_data = vision.extract_faces(img_t)
+        face_embs = [f["embedding"] for f in face_data]
+        aesthetic = musiq = clipiqa = None
+        if aesthetic_enabled:
+            aesthetic = vision.extract_aesthetic_score(img_t)
+            musiq = vision.extract_musiq_score(img_t)
+            clipiqa = vision.extract_clipiqa_score(img_t)
+
+        quality_info = analyze_image_fast(img_t, st.st_size, strength="advanced")
+        if aesthetic_enabled:
+            quality_info.aesthetic_score = aesthetic
+            quality_info.musiq_score = musiq
+            quality_info.clipiqa_score = clipiqa
+
+        if _local_vlm_should_skip_llm(quality_info):
+            _logging.getLogger("pic_selecter").info(
+                f"[local_vlm] {Path(path).name}: fast-advanced 预审拒片 "
+                f"reason='{quality_info.reject_reason}' → 跳过 LLM"
+            )
+        elif quality_info.auto_reject:
+            _logging.getLogger("pic_selecter").info(
+                f"[local_vlm] {Path(path).name}: fast-advanced 预审疑似拒片 "
+                f"reason='{quality_info.reject_reason}' → VLM 复判"
+            )
+
+        ts_unix = ts_dt.timestamp() if ts_dt else None
+        return ImageInfo(
+            path=path,
+            companions=list(companions),
+            phash=str(ph),
+            timestamp=ts_unix,
+            size=st.st_size,
+            mtime=st.st_mtime,
+            exif_summary=exif_sum,
+            quality=quality_info.to_dict(),
+            dinov2=dinov2_vec,
+            aesthetic_score=aesthetic,
+            musiq_score=musiq,
+            clipiqa_score=clipiqa,
+            face_embeddings=face_embs,
+        ), None
+    except Exception as e:
+        if _is_llm_judge_error(e):
+            raise
+        return None, _format_process_error(e)
+    finally:
+        if img is not None:
+            try:
+                img.close()
+            except Exception:
+                pass
+
+
+def _finalize_local_vlm_judgement(info: ImageInfo, strength: str = "standard",
+                                  llm_model: Optional[str] = None,
+                                  companions: Optional[list[str]] = None
+                                  ) -> tuple[Optional[ImageInfo], Optional[str]]:
+    companions = companions if companions is not None else info.companions
+    img = None
+    try:
+        st = os.stat(info.path)
+        img = _load_image_for_analysis(info.path, companions or [])
+        img_t = _resize_for_analysis(ImageOps.exif_transpose(img))
+
+        from pic_selecter import llm_judge
+        from pic_selecter.quality import analyze_basic
+
+        model = llm_model or llm_judge.default_model(provider="local_vlm")
+        if not model:
+            return None, "local_vlm 缺少 llm_model 参数"
+        judgement = llm_judge.judge_image(
+            img_t, model=model, strength=strength, provider="local_vlm",
+        )
+        verdict = judgement["verdict"]
+        reason = judgement["reason"]
+        quality_info = analyze_basic(
+            img_t, st.st_size,
+            llm_verdict=verdict,
+            llm_reason=reason,
+        )
+        quality_info.aesthetic_score = info.aesthetic_score
+        quality_info.musiq_score = info.musiq_score
+        quality_info.clipiqa_score = info.clipiqa_score
+
+        return replace(
+            info,
+            quality=quality_info.to_dict(),
+            llm_verdict=verdict,
+            llm_reason=reason,
+        ), None
+    except Exception as e:
+        if _is_llm_judge_error(e):
+            raise
+        return None, _format_process_error(e)
+    finally:
+        if img is not None:
+            try:
+                img.close()
+            except Exception:
+                pass
+
+
+def _compute_infos_local_vlm_two_stage(
+    folder: str,
+    files: list[str],
+    companions_by_primary: dict[str, list[str]],
+    needed: list[str],
+    *,
+    progress: Optional[Callable[[int, int, str], None]],
+    cancel_check: Optional[Callable[[], bool]],
+    strength: str,
+    face_aware: bool,
+    event_cb: Optional[Callable[[str, str, Optional["ImageInfo"], Optional[str]], None]],
+    llm_model: Optional[str],
+    aesthetic_enabled: bool,
+) -> tuple[dict[str, ImageInfo], list[tuple[str, str]]]:
+    import logging
+
+    log = logging.getLogger("pic_selecter")
+    fresh: dict[str, ImageInfo] = {}
+    skipped: list[tuple[str, str]] = []
+    stage_infos: list[ImageInfo] = []
+    total = len(files)
+
+    def _check_cancel():
+        if cancel_check and cancel_check():
+            raise CancelledError()
+
+    for done, f in enumerate(needed, start=1):
+        _check_cancel()
+        info, reason = _process_local_vlm_features(
+            f, strength, face_aware,
+            companions_by_primary.get(f, []),
+            aesthetic_enabled,
+        )
+        if info:
+            fresh[info.path] = info
+            stage_infos.append(info)
+            if _local_vlm_should_skip_llm(info.quality or {}) and event_cb:
+                try:
+                    event_cb(Path(f).name, f, info, None)
+                except Exception:
+                    pass
+        else:
+            skipped.append((f, reason or "未知原因"))
+            if event_cb:
+                try:
+                    event_cb(Path(f).name, f, None, reason)
+                except Exception:
+                    pass
+        if progress:
+            progress(done, total, f"本地视觉特征：{Path(f).name}")
+
+    try:
+        _write_local_vlm_stage1_cache(folder, stage_infos)
+        log.info(
+            f"[local_vlm] 第一阶段缓存已写入 {_local_vlm_stage1_cache_path(folder)} "
+            f"({len(stage_infos)} 张)"
+        )
+    except Exception as e:
+        log.warning(f"[local_vlm] 第一阶段缓存写入失败（继续运行）: {e}")
+
+    _release_vision_models_for_local_vlm()
+
+    pending = [
+        info for info in stage_infos
+        if not _local_vlm_should_skip_llm(info.quality or {})
+    ]
+    if progress:
+        progress(0, len(pending), "释放 CUDA 后开始本地 VLM 判图")
+
+    for done, info in enumerate(pending, start=1):
+        _check_cancel()
+        final_info, reason = _finalize_local_vlm_judgement(
+            info, strength, llm_model,
+            companions_by_primary.get(info.path, info.companions),
+        )
+        if final_info:
+            fresh[final_info.path] = final_info
+        else:
+            fresh.pop(info.path, None)
+            skipped.append((info.path, reason or "未知原因"))
+        if progress:
+            progress(done, len(pending), f"本地 VLM 判图：{Path(info.path).name}")
+        if event_cb:
+            try:
+                event_cb(Path(info.path).name, info.path, final_info, reason)
+            except Exception:
+                pass
+
+    return fresh, skipped
 
 
 def scan_folder(folder: str) -> list[tuple[str, list[str]]]:
@@ -630,12 +959,14 @@ def compute_infos(
     event_cb: Optional[Callable[[str, str, Optional["ImageInfo"], Optional[str]], None]] = None,
     engine: str = "expert",
     llm_model: Optional[str] = None,
+    aesthetic_enabled: bool = True,
 ) -> tuple[list[ImageInfo], list[tuple[str, str]]]:
     """读取每张图片的 pHash + 时间戳 + EXIF 摘要，加上 engine 对应的额外签名。
 
     engine="fast"：算 dHash/wHash/aHash + HSV 直方图 + ORB 描述子 + fast_quality
     engine="expert"：算 DINOv2 + NIMA/MUSIQ/CLIP-IQA+ 美学 + InsightFace 人脸 + quality
-    engine="tycoon"：算 DINOv2 + InsightFace（分组用）+ LLM 视觉判定（拒片用）。
+    engine="tycoon"：算 DINOv2 + InsightFace（分组用）+ Ark 视觉判定（拒片用）。
+    engine="local_vlm"：算 DINOv2 + InsightFace（分组用）+ 本地 VLM 视觉判定（拒片用）。
       llm_model 必填，由前端通过 list_models() 取并由用户选定。
 
     返回 (info_list, skipped_list)，skipped_list 元素为 (path, reason)。
@@ -688,11 +1019,29 @@ def compute_infos(
         if cancel_check and cancel_check():
             raise CancelledError()
 
+    if needed and engine == "local_vlm" and _local_vlm_two_stage_enabled():
+        fresh, stage_skipped = _compute_infos_local_vlm_two_stage(
+            folder,
+            files,
+            companions_by_primary,
+            needed,
+            progress=progress,
+            cancel_check=cancel_check,
+            strength=strength,
+            face_aware=face_aware,
+            event_cb=event_cb,
+            llm_model=llm_model,
+            aesthetic_enabled=aesthetic_enabled,
+        )
+        skipped.extend(stage_skipped)
+        needed = []
+
     if needed:
         # 工作线程数：
         # - expert：CUDA 下给少量并发把 GPU 喂起来；MPS / CPU 仍保守单线程
         # - tycoon：用 ARK_MAX_WORKERS（默认 20）作为 ThreadPool 上限；
         #          实际并发由 llm_judge._LIMITER 自适应控制（起 10、触发限流减半）
+        # - local_vlm：默认单线程，避免本机 VLM 并发撑爆显存；可用 LOCAL_VLM_MAX_WORKERS 调整
         # - fast：纯 CPU + numpy/cv2，开 8 线程没问题
         if workers is None:
             if engine == "expert":
@@ -700,6 +1049,9 @@ def compute_infos(
             elif engine == "tycoon":
                 workers = int(os.getenv("ARK_MAX_WORKERS", "20"))
                 workers = max(1, min(workers, 32))
+            elif engine == "local_vlm":
+                workers = int(os.getenv("LOCAL_VLM_MAX_WORKERS", "1"))
+                workers = max(1, min(workers, 4))
             else:
                 workers = min(8, max(2, (os.cpu_count() or 4)))
         ex = ThreadPoolExecutor(max_workers=workers)
@@ -707,7 +1059,7 @@ def compute_infos(
             futures = {
                 ex.submit(
                     _process_one, f, strength, face_aware, engine, llm_model,
-                    companions_by_primary.get(f, []),
+                    companions_by_primary.get(f, []), aesthetic_enabled,
                 ): f
                 for f in needed
             }
@@ -796,7 +1148,7 @@ def compute_infos(
             n_face = sum(1 for i in result_list if i.face_embeddings)
             total = max(1, len(result_list))
             log.info(
-                f"[expert] compute_infos 完成：成功 {len(result_list)} / 跳过 {len(skipped)}；"
+                f"[{engine}] compute_infos 完成：成功 {len(result_list)} / 跳过 {len(skipped)}；"
                 f"DINOv2 {n_dino} ({n_dino * 100 // total}%) · "
                 f"NIMA {n_aes} ({n_aes * 100 // total}%) · "
                 f"有脸 {n_face} ({n_face * 100 // total}%)"
@@ -816,9 +1168,9 @@ def group_infos(
     """分组分发器。失败直接抛——不再静默回退。
 
     engine="fast"：fast_clustering.cluster（4 hash + HSV + ORB 几何验证 + 时间硬切段）
-    engine="expert" / "tycoon"：clustering.cluster（DINOv2 + 多信号融合）。
-      tycoon 在分组维度上和 expert 等价（都靠 DINOv2 + InsightFace），
-      区别只在初筛走 LLM 而非本地拒片。
+    engine="expert" / "tycoon" / "local_vlm"：clustering.cluster（DINOv2 + 多信号融合）。
+      tycoon/local_vlm 在分组维度上和 expert 等价（都靠 DINOv2 + InsightFace），
+      区别只在初筛走视觉语言模型而非本地拒片。
     """
     import logging
     log = logging.getLogger("pic_selecter")
@@ -831,11 +1183,11 @@ def group_infos(
     if engine == "fast":
         from pic_selecter import fast_clustering
         idx_groups = fast_clustering.cluster(infos)
-    elif engine in ("expert", "tycoon"):
+    elif engine in ("expert", "tycoon", "local_vlm"):
         from pic_selecter import clustering
         idx_groups = clustering.cluster(infos)
     else:
-        raise ValueError(f"未知 engine: {engine!r}（仅支持 'fast' / 'expert' / 'tycoon'）")
+        raise ValueError(f"未知 engine: {engine!r}（仅支持 'fast' / 'expert' / 'tycoon' / 'local_vlm'）")
     sizes = sorted((len(g) for g in idx_groups), reverse=True)
     multi = sum(1 for g in idx_groups if len(g) > 1)
     log.info(

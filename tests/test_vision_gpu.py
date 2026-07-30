@@ -82,6 +82,21 @@ def test_launcher_tycoon_includes_local_vision_stack():
     assert "pyiqa>=0.1.10" not in packages
 
 
+def test_launcher_local_vlm_includes_local_vision_and_openai_stack():
+    launcher_path = Path(__file__).resolve().parent.parent / "scripts" / "launcher.py"
+    spec = importlib.util.spec_from_file_location("launcher_for_test_local_vlm", launcher_path)
+    launcher = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(launcher)
+
+    packages = set(launcher.packages_for_modes(["local_vlm"]))
+    assert "openai>=1.40" in packages
+    assert "transformers>=4.40" in packages
+    assert "insightface>=0.7" in packages
+    assert "pyiqa>=0.1.10" in packages
+    assert "timm>=0.9" in packages
+
+
 def test_launcher_cuda_torch_install_uses_pytorch_index_only(monkeypatch):
     launcher_path = Path(__file__).resolve().parent.parent / "scripts" / "launcher.py"
     spec = importlib.util.spec_from_file_location("launcher_for_test_cuda", launcher_path)
