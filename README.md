@@ -273,7 +273,7 @@ Windows 系统可能需要安装微软官方的 HEIF 扩展才能正常在浏览
 
 <details>
 <summary><b>8. 遇到报错？</b></summary>
-详见我们的 [故障排查指南](/TROUBLESHOOTING.md)
+详见我们的 <a href="/TROUBLESHOOTING.md">故障排查指南</a>
 </details>
 
 ---
