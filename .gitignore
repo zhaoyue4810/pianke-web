@@ -60,5 +60,8 @@ job-*.log
 *.log
 .tmp_*/
 
+# 用户个性化设置设定
+.pic_selecter_install.json
+
 # 内部审计 / 设计文档，不入库
 docs/

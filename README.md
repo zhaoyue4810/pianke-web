@@ -271,6 +271,11 @@ LOCAL_VLM_NUM_PREDICT=128
 Windows 系统可能需要安装微软官方的 HEIF 扩展才能正常在浏览器中预览该格式；片刻工具在后端能够正常分析处理该格式。
 </details>
 
+<details>
+<summary><b>8. 遇到报错？</b></summary>
+详见我们的 [故障排查指南](/TROUBLESHOOTING.md)
+</details>
+
 ---
 
 ## 隐私与安全说明
