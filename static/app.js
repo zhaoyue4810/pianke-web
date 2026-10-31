@@ -353,7 +353,7 @@ function syncLocalVlmStatus() {
   const badge = $("tycoon-key-badge");
   const btn = $("tycoon-key-btn");
   const edit = $("tycoon-key-edit");
-  if (badge) badge.innerHTML = `<span class="tycoon-key-ok">●</span> 本地 Ollama`;
+  if (badge) badge.innerHTML = `<span class="tycoon-key-ok">●</span> 本地视觉服务`;
   if (btn) btn.hidden = true;
   if (edit) edit.hidden = true;
   loadLlmModels("local_vlm");
@@ -422,7 +422,7 @@ async function saveArkKey() {
 }
 
 async function clearArkKey() {
-  if (!confirm("清除 API Key？\n\n本地存储的 key 会被删掉，需要重新输入才能用土豪模式。")) return;
+  if (!confirm("清除 API Key？\n\n本地存储的 key 会被删掉，需要重新输入才能用云端模式。")) return;
   try {
     await fetch("/api/ark_key", { method: "DELETE" });
     llmModelsLoadedProvider = null;
@@ -481,7 +481,7 @@ async function loadLlmModels(provider = currentLlmProvider()) {
     if (!r.ok) {
       select.innerHTML = '<option value="">不可用</option>';
       hint.textContent = provider === "local_vlm"
-        ? `× ${data.error || "拉取本地模型列表失败"}。请确认 Ollama 已启动并已安装 gemma4:12b。`
+        ? `× ${data.error || "拉取本地模型列表失败"}。请确认本机视觉服务已启动并已安装模型。`
         : `× ${data.error || "拉取模型列表失败"}。请设置 ARK_API_KEY 后重启服务。`;
       hint.classList.add("tycoon-hint-error");
       return;
@@ -490,8 +490,8 @@ async function loadLlmModels(provider = currentLlmProvider()) {
     if (!models.length) {
       select.innerHTML = '<option value="">无可用模型</option>';
       hint.textContent = provider === "local_vlm"
-        ? "× 本地模型服务未返回模型，请先运行 ollama run gemma4:12b。"
-        : "× Ark 账号未返回 Seed 系列视觉模型，请到火山引擎控制台开通。";
+        ? "× 本机视觉服务未返回模型，请先在服务中安装模型。"
+        : "× 云端账号未返回可用的视觉模型，请到服务商控制台开通。";
       hint.classList.add("tycoon-hint-error");
       return;
     }
@@ -526,8 +526,8 @@ async function loadLlmModels(provider = currentLlmProvider()) {
       select.value = groups.mini[groups.mini.length - 1].id;
     }
     hint.textContent = provider === "local_vlm"
-      ? "已就绪。图片只会发送到本机 Ollama 服务，不上传云端。"
-      : "已就绪。图片会上传至火山引擎服务器，按 token 计费。";
+      ? "已就绪。图片只会发送到本机视觉服务，不上传云端。"
+      : "已就绪。图片会上传至云端服务商，按用量计费。";
     hint.classList.remove("tycoon-hint-error");
     llmModelsLoadedProvider = provider;
   } catch (e) {
@@ -713,7 +713,7 @@ async function handleStart(e) {
       return;
     }
     if (engine === "local_vlm" && !llm_model) {
-      setStatus("请先选择一个本地 VLM 模型再开始", "error");
+      setStatus("请先选择一个本地视觉模型再开始", "error");
       $("start-btn").disabled = false;
       return;
     }

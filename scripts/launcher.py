@@ -107,8 +107,8 @@ MODE_PACKAGES = {
 MODE_LABELS = {
     "fast": "极速模式（纯本地，约 200MB，下载 1-3 分钟）",
     "expert": "专家模式（深度学习，约 2-3GB，下载 5-15 分钟）",
-    "tycoon": "土豪模式（LLM 判图，约 5MB，需自备 API key）",
-    "local_vlm": "本地 VLM 模式（Ollama/Gemma + 本地美学模型，约 2-3GB，需本机模型服务）",
+    "tycoon": "云端模式（云端判图，约 5MB，需自备 API key）",
+    "local_vlm": "本地视觉模式（本地美学评分，约 2-3GB，需本机视觉服务）",
 }
 
 
@@ -384,7 +384,7 @@ MODE_TIME_ESTIMATE = {
     "fast": "1-3 分钟",
     "expert": "5-15 分钟（取决于网速；torch/insightface 加起来 ~2GB）",
     "tycoon": "约 30 秒",
-    "local_vlm": "5-15 分钟（本地 VLM + NIMA/MUSIQ/CLIP-IQA 美学模型）",
+    "local_vlm": "5-15 分钟（本地视觉 + 本地美学评分）",
 }
 
 
@@ -514,7 +514,7 @@ def ensure_runtime_backends(modes: list[str], runtime: str = "auto") -> str:
     if not any(m in {"expert", "tycoon", "local_vlm"} for m in modes):
         return "none"
     if wants_cuda_backend(modes, runtime):
-        info(f"检测到 NVIDIA GPU，安装 CUDA 版 PyTorch（{PYTORCH_CUDA_FLAVOR}）+ ONNX Runtime GPU")
+        info("检测到 NVIDIA 显卡，安装显卡加速版依赖")
         pip_uninstall(["onnxruntime", "onnxruntime-gpu", "onnxruntime-directml", "torch", "torchvision", "torchaudio"])
         pip_install(
             TORCH_CUDA_PACKAGES,

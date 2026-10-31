@@ -1,6 +1,6 @@
 """相机水印渲染模块。
 
-11 个样式 ID。详尽程度直接拆进样式名里（xx-详尽 / xx-极简），不再单独切换：
+10 个样式 ID。详尽程度直接拆进样式名里（xx-详尽 / xx-极简），不再单独切换：
 
   A          标准底栏        （只有一个版本）
   B_full     极简底栏-详尽
@@ -12,7 +12,6 @@
   F_full     杂志风-详尽
   F_clean    杂志风-极简
   G          极简白边        （无任何信息）
-  H          相机回放        （无任何信息）
 
 「详尽」= 带镜头·参数·时间；「极简」= 仅品牌 Logo + 机型。
 
@@ -50,13 +49,6 @@ logger = logging.getLogger("pic_selecter")
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOGOS_DIR = _PROJECT_ROOT / "assets" / "logos"
-# 样式 H 的相机素材
-CAMERA_BACK_PATH = _PROJECT_ROOT / "assets" / "camera_xt5_back.png"
-# 相机 LCD 屏 / 取景器玻璃在原 PNG 中的相对坐标（基于像素分析）。
-# 注意：渲染时会先把 PNG 紧裁剪到相机本体 bbox，所以下面的比例会在 _camera_back_rgba
-# 里换算成相对裁剪图像的比例后再用。
-_CAMERA_SCREEN_RATIO_PNG = (0.1566, 0.4206, 0.6109, 0.7955)  # (l, t, r, b)
-_CAMERA_VIEWFINDER_RATIO_PNG = (0.385, 0.238, 0.490, 0.318)
 
 _LOGO_MAP: list[tuple[str, str]] = [
     ("fuji", "fujifilm.png"),
@@ -84,7 +76,7 @@ _LOGO_MAP: list[tuple[str, str]] = [
 class WatermarkConfig:
     """前端 JSON → 这个对象。
 
-    template: 见模块 docstring 的 11 个样式 ID 之一。
+    template: 见模块 docstring 的 10 个样式 ID 之一。
     详尽程度已经编码在样式 ID 里（B_full / B_clean 等），不再额外切换。
     """
     template: str = "A"
@@ -890,237 +882,6 @@ def _render_G(img: Image.Image, exif: ExifInfo,
 
 
 # ============================================================
-# 样式 H：相机回放（上原图 / 下模糊版 + 居中相机 + 屏幕/取景器内嵌缩略）
-# ============================================================
-
-# 模块级缓存：(rgba, screen_ratio, viewfinder_ratio)。
-# 抠白 + 紧裁剪后 ratio 也跟着变，一起缓存。
-_CAMERA_RGBA_CACHE: Optional[tuple[Image.Image, tuple, tuple]] = None
-
-
-def _camera_back_rgba() -> Optional[tuple[Image.Image, tuple, tuple]]:
-    """加载相机 PNG，抠白底 + 紧裁剪到相机本体 bbox。
-
-    返回 (rgba, screen_ratio, viewfinder_ratio)。两个 ratio 都是相对裁剪后图像
-    归一的 (l, t, r, b)；失败返回 None。
-
-    白底抠法：min(R,G,B) ≥ 245 → alpha=0（硬切，消除半透明白晕）；
-    min(R,G,B) ≤ 220 → alpha=255；之间线性。机身和文字都在 v<100，不会被误伤。
-    """
-    global _CAMERA_RGBA_CACHE
-    if _CAMERA_RGBA_CACHE is not None:
-        return _CAMERA_RGBA_CACHE
-    if not CAMERA_BACK_PATH.exists():
-        logger.warning(f"相机素材缺失: {CAMERA_BACK_PATH}")
-        return None
-    try:
-        src = Image.open(CAMERA_BACK_PATH).convert("RGB")
-    except Exception:
-        logger.exception(f"加载 {CAMERA_BACK_PATH} 失败")
-        return None
-    W, H = src.size
-    r, g, b = src.split()
-    min_rgb = ImageChops.darker(ImageChops.darker(r, g), b)
-    # 245 处硬切：v=245→0, v=220→255
-    alpha = min_rgb.point(lambda v: max(0, min(255, int((245 - v) * 10.2))))
-    rgba = Image.merge("RGBA", (r, g, b, alpha))
-    bbox = alpha.getbbox()
-    if bbox is None:
-        return None
-    rgba = rgba.crop(bbox)
-    cw, ch = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    cx0, cy0 = bbox[0], bbox[1]
-
-    def _remap(rt: tuple) -> tuple:
-        l, t, r_, b_ = rt
-        return ((l * W - cx0) / cw, (t * H - cy0) / ch,
-                (r_ * W - cx0) / cw, (b_ * H - cy0) / ch)
-
-    _CAMERA_RGBA_CACHE = (rgba,
-                          _remap(_CAMERA_SCREEN_RATIO_PNG),
-                          _remap(_CAMERA_VIEWFINDER_RATIO_PNG))
-    return _CAMERA_RGBA_CACHE
-
-
-def _build_drop_shadow(rgba: Image.Image, blur: int, offset_y: int,
-                       opacity: int) -> tuple[Image.Image, tuple[int, int]]:
-    """从 alpha 通道生成柔和投影。返回 (shadow, (dx, dy))，
-    贴到 (cam_x + dx, cam_y + dy) 即可。"""
-    pad = blur * 3
-    sw, sh = rgba.size
-    canvas = Image.new("RGBA", (sw + pad * 2, sh + pad * 2), (0, 0, 0, 0))
-    shadow_solid = Image.new("RGBA", (sw, sh), (0, 0, 0, opacity))
-    shadow_solid.putalpha(
-        ImageChops.multiply(rgba.split()[-1],
-                            Image.new("L", (sw, sh), opacity))
-    )
-    canvas.paste(shadow_solid, (pad, pad), shadow_solid)
-    canvas = canvas.filter(ImageFilter.GaussianBlur(radius=blur))
-    return canvas, (-pad, -pad + offset_y)
-
-
-def _fit_into(src: Image.Image, target_w: int, target_h: int,
-              bg=(10, 10, 12)) -> Image.Image:
-    sw, sh = src.size
-    scale = min(target_w / sw, target_h / sh)
-    new_w = max(1, int(round(sw * scale)))
-    new_h = max(1, int(round(sh * scale)))
-    resized = src.resize((new_w, new_h), Image.LANCZOS)
-    canvas = Image.new("RGB", (target_w, target_h), bg)
-    canvas.paste(resized, ((target_w - new_w) // 2, (target_h - new_h) // 2))
-    return canvas
-
-
-def _add_screen_depth(canvas: Image.Image, x0: int, y0: int,
-                      w: int, h: int) -> None:
-    """屏幕内阴影 + 顶部柔光，模拟嵌入机身的 LCD 玻璃感。"""
-    ref = min(w, h)
-    inset = max(2, int(ref * 0.025))
-    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    od = ImageDraw.Draw(overlay)
-    for i in range(inset):
-        a = int(140 * (1 - i / inset) ** 2)
-        od.rectangle([i, i, w - 1 - i, h - 1 - i], outline=(0, 0, 0, a))
-    overlay = overlay.filter(ImageFilter.GaussianBlur(radius=max(1, inset // 3)))
-    canvas.paste(overlay, (x0, y0), overlay)
-
-    gloss = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(gloss)
-    steps = max(1, h // 3)
-    for i in range(steps):
-        a = int(55 * (1 - i / steps) ** 1.6)
-        gd.line([(0, i), (int(w * 0.55), i + int(h * 0.15))],
-                fill=(255, 255, 255, a), width=2)
-    gloss = gloss.filter(ImageFilter.GaussianBlur(radius=max(2, int(ref * 0.012))))
-    canvas.paste(gloss, (x0, y0), gloss)
-
-
-def _paste_viewfinder_inset(canvas: Image.Image, photo: Image.Image,
-                            cam_x: int, cam_y: int,
-                            cam_w: int, cam_h: int,
-                            vf_ratio: tuple) -> None:
-    """取景器圆玻璃里嵌入压暗的小照片 + 右上小高光，模拟透过镜筒看到的画面。"""
-    vl, vt, vr, vb = vf_ratio
-    vx0 = cam_x + int(cam_w * vl)
-    vy0 = cam_y + int(cam_h * vt)
-    vx1 = cam_x + int(cam_w * vr)
-    vy1 = cam_y + int(cam_h * vb)
-    vw, vh = vx1 - vx0, vy1 - vy0
-    if vw < 8 or vh < 8:
-        return
-
-    pw, ph = photo.size
-    scale = max(vw / pw, vh / ph)
-    rw, rh = max(1, int(pw * scale)), max(1, int(ph * scale))
-    resized = photo.resize((rw, rh), Image.LANCZOS)
-    cx, cy = rw // 2, rh // 2
-    inset = resized.crop((cx - vw // 2, cy - vh // 2,
-                          cx - vw // 2 + vw, cy - vh // 2 + vh))
-    inset = inset.convert("RGB")
-    inset = Image.eval(inset, lambda v: min(255, int(v * 0.78) + 18))
-
-    mask = Image.new("L", (vw, vh), 0)
-    md = ImageDraw.Draw(mask)
-    md.ellipse((1, 1, vw - 2, vh - 2), fill=255)
-    mask = mask.filter(ImageFilter.GaussianBlur(radius=max(1, vw // 18)))
-
-    inset_rgba = inset.convert("RGBA")
-    inset_rgba.putalpha(mask)
-    canvas.alpha_composite(inset_rgba, (vx0, vy0))
-
-    glare = Image.new("RGBA", (vw, vh), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(glare)
-    gd.ellipse((int(vw * 0.55), int(vh * 0.05),
-                int(vw * 0.95), int(vh * 0.45)),
-               fill=(255, 255, 255, 70))
-    glare = glare.filter(ImageFilter.GaussianBlur(radius=max(2, vw // 12)))
-    glare_masked = Image.new("RGBA", (vw, vh), (0, 0, 0, 0))
-    glare_masked.paste(glare, (0, 0), mask)
-    canvas.alpha_composite(glare_masked, (vx0, vy0))
-
-
-def _render_H(img: Image.Image, exif: ExifInfo,
-              show_params: bool = True) -> Image.Image:
-    _ = exif, show_params
-    cache = _camera_back_rgba()
-    if cache is None:
-        # 没有相机素材就退回 G 极简白边，至少不报错
-        return _render_G(img, exif, show_params)
-    camera_rgba, screen_ratio, vf_ratio = cache
-
-    pw, ph = img.size
-    short = min(pw, ph)
-
-    canvas = Image.new("RGB", (pw, ph * 2), (0, 0, 0))
-    # 上半部：原图
-    canvas.paste(img, (0, 0))
-    # 下半部：轻度模糊版
-    blur_radius = max(6, int(short * 0.008))
-    blurred = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-    canvas.paste(blurred, (0, ph))
-
-    cam_w0, cam_h0 = camera_rgba.size
-    target_h = int(ph * 0.73)
-    target_w = int(target_h * cam_w0 / cam_h0)
-    max_w = int(pw * 0.88)
-    if target_w > max_w:
-        target_w = max_w
-        target_h = int(target_w * cam_h0 / cam_w0)
-    camera = camera_rgba.resize((target_w, target_h), Image.LANCZOS)
-
-    cam_x = (pw - target_w) // 2
-    # 贴齐画布底部；接触投影会自然延伸到画面外（被裁剪），呈现"坐在画框边缘"的效果
-    cam_y = ph * 2 - target_h
-
-    sl, st, sr, sb = screen_ratio
-    scr_x0 = cam_x + int(target_w * sl)
-    scr_y0 = cam_y + int(target_h * st)
-    scr_x1 = cam_x + int(target_w * sr)
-    scr_y1 = cam_y + int(target_h * sb)
-    scr_w, scr_h = scr_x1 - scr_x0, scr_y1 - scr_y0
-    preview = _fit_into(img, scr_w, scr_h)
-
-    canvas_rgba = canvas.convert("RGBA")
-
-    # 两层投影：环境（大半径低不透明度）+ 接触（小半径高不透明度）
-    amb_blur = max(40, int(target_h * 0.08))
-    shadow_amb, (dxa, dya) = _build_drop_shadow(
-        camera, blur=amb_blur, offset_y=int(target_h * 0.04), opacity=90
-    )
-    canvas_rgba.alpha_composite(shadow_amb, (cam_x + dxa, cam_y + dya))
-    con_blur = max(8, int(target_h * 0.015))
-    shadow_con, (dxc, dyc) = _build_drop_shadow(
-        camera, blur=con_blur, offset_y=int(target_h * 0.008), opacity=200
-    )
-    canvas_rgba.alpha_composite(shadow_con, (cam_x + dxc, cam_y + dyc))
-
-    # 相机本体淡晕影（用 alpha 限制只落在机身上）
-    vign = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
-    vd = ImageDraw.Draw(vign)
-    for i in range(8):
-        k = i / 8
-        a = int(45 * k * k)
-        pad_x = int(target_w * (0.02 + k * 0.08))
-        pad_y = int(target_h * (0.02 + k * 0.08))
-        vd.rectangle([pad_x, pad_y, target_w - pad_x, target_h - pad_y],
-                     outline=(0, 0, 0, a), width=max(2, target_w // 200))
-    vign = vign.filter(ImageFilter.GaussianBlur(radius=max(4, target_w // 60)))
-    cam_alpha = camera.split()[-1]
-    vign.putalpha(ImageChops.multiply(vign.split()[-1], cam_alpha))
-
-    canvas_rgba.alpha_composite(camera, (cam_x, cam_y))
-    canvas_rgba.alpha_composite(vign, (cam_x, cam_y))
-
-    canvas_rgba.paste(preview, (scr_x0, scr_y0))
-    _add_screen_depth(canvas_rgba, scr_x0, scr_y0, scr_w, scr_h)
-    _paste_viewfinder_inset(canvas_rgba, img,
-                            cam_x, cam_y, target_w, target_h,
-                            vf_ratio)
-
-    return canvas_rgba.convert("RGB")
-
-
-# ============================================================
 # 调度
 # ============================================================
 
@@ -1136,7 +897,6 @@ _STYLE_SPECS: dict[str, tuple[Callable, bool]] = {
     "F_full":  (_render_F, True),
     "F_clean": (_render_F, False),
     "G":       (_render_G, True),   # show_params 被忽略
-    "H":       (_render_H, True),   # show_params 被忽略
 }
 
 # 给前端用的友好元数据
@@ -1161,8 +921,6 @@ _STYLE_META = {
                 "desc": "左下色卡（从图自动提取）+ 右下品牌 + 机型"},
     "G":       {"name": "极简白边",
                 "desc": "照片四周均匀窄白边，无任何文字"},
-    "H":       {"name": "相机回放",
-                "desc": "上原图 + 下模糊版 + 居中富士 X-T5，LCD 与取景器都显示画面"},
 }
 
 

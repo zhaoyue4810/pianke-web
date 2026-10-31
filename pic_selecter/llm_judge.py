@@ -550,7 +550,7 @@ def _base_url(provider: str) -> str:
 
 
 def _provider_label(provider: str) -> str:
-    return "本地 VLM" if provider == PROVIDER_LOCAL_VLM else "Ark"
+    return "本地视觉" if provider == PROVIDER_LOCAL_VLM else "云端"
 
 
 def _ollama_api_base() -> str:
@@ -574,7 +574,7 @@ def _api_key(provider: str = PROVIDER_ARK) -> str:
         return os.getenv("LOCAL_VLM_API_KEY", "ollama").strip() or "ollama"
     key = os.getenv("ARK_API_KEY", "").strip()
     if not key:
-        raise LLMJudgeError("ARK_API_KEY 未设置，请配置火山引擎 API Key 后重试")
+        raise LLMJudgeError("ARK_API_KEY 未设置，请配置云端服务 API Key 后重试")
     return key
 
 
@@ -725,7 +725,7 @@ def require_llm_capabilities(provider: str = PROVIDER_ARK,
         raise LLMJudgeError(f"{_provider_label(provider)} 连通性校验失败：{type(e).__name__}: {e}") from e
     if not models:
         if provider == PROVIDER_LOCAL_VLM:
-            raise LLMJudgeError("本地 VLM 未返回可用模型，请确认 Ollama 已启动并已安装 gemma4:12b")
+            raise LLMJudgeError("本地视觉服务未返回可用模型，请确认服务已启动并已安装模型")
         raise LLMJudgeError("Ark 账号无可用的 Seed 系列视觉模型，请检查账号权限")
     required = (model or default_model(provider) or "").strip()
     if required and required not in {m["id"] for m in models}:

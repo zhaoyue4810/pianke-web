@@ -859,7 +859,7 @@ def _compute_infos_local_vlm_two_stage(
         if not _local_vlm_should_skip_llm(info.quality or {})
     ]
     if progress:
-        progress(0, len(pending), "释放 CUDA 后开始本地 VLM 判图")
+        progress(0, len(pending), "开始本地视觉判图")
 
     for done, info in enumerate(pending, start=1):
         _check_cancel()
@@ -873,7 +873,7 @@ def _compute_infos_local_vlm_two_stage(
             fresh.pop(info.path, None)
             skipped.append((info.path, reason or "未知原因"))
         if progress:
-            progress(done, len(pending), f"本地 VLM 判图：{Path(info.path).name}")
+            progress(done, len(pending), f"本地视觉判图：{Path(info.path).name}")
         if event_cb:
             try:
                 event_cb(Path(info.path).name, info.path, final_info, reason)
