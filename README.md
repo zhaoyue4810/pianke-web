@@ -106,7 +106,7 @@
 
 ### 方式一：一键启动（推荐非开发者）
 
-1. [下载项目 ZIP 压缩包](https://github.com/zhaoyue4810/pianke-web/archive/refs/heads/main.zip) 并解压到本地。
+1. [下载项目 ZIP 压缩包](https://github.com/zhaoyue4810/pianke/archive/refs/heads/main.zip) 并解压到本地。
 2. 双击运行对应的启动器脚本：
 
 | 系统 | 启动脚本 | 首次运行安全提示 |
@@ -277,7 +277,7 @@ Windows 可能需要安装微软官方的 HEIF 扩展才能在浏览器里预览
 
 ## 反馈
 
-- 开源网页版：[GitHub Issues](https://github.com/zhaoyue4810/pianke-web/issues)
+- 开源网页版：[GitHub Issues](https://github.com/zhaoyue4810/pianke/issues)
 - 片刻 App：[官网支持页](https://pianke.kongbaige.xyz/support/)
 - 微信：15828377122
 

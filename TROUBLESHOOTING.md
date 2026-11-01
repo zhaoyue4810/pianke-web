@@ -12,7 +12,7 @@
 - **解决方案**：
   1. 安装最新版 Microsoft Visual C++ Redistributable https://aka.ms/vc14/vc_redist.x64.exe
   2. 将项目更新至最新版
-  3. 详见 [issue](https://github.com/zhaoyue4810/pianke-web/issues/15)
+  3. 详见 [issue](https://github.com/zhaoyue4810/pianke/issues/15)
 
 ### 2. [WinError 1114] 动态链接库(DLL)初始化例程失败
 - **报错**：`OSError: [WinError 1114] 动态链接库(DLL)初始化例程失败。 Error loading "C:\...\spianke\.venv\Lib\site-packages\torch\lib\c10.dll" or one of its dependencies.`
